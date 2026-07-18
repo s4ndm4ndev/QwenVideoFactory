@@ -1,0 +1,33 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Node (if tooling gets added later)
+node_modules/
+npm-debug.log*
+
+# Chrome extension packaging output
+*.crx
+*.pem
+*.zip
+
+# AI assistant tooling / local instructions — not meant to be shared via git.
+# This repo uses CHANGELOG.md as the cross-session record instead (see its
+# header note); these files are personal/local config for whichever AI tool
+# you're using and can differ machine to machine.
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.cursorrules
+.cursor/
+.windsurfrules
+.windsurf/
+.clinerules
+.roo/
+.aider*
+.continue/

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen Video Factory — Privacy Policy</title>
+<style>
+  :root {
+    --ink: #101828;
+    --muted: #4b5568;
+    --line: #e4e7ec;
+    --accent: #1fc0aa;
+    --bg: #ffffff;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+  h1 {
+    font-size: 32px;
+    margin-bottom: 4px;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 14px;
+    margin-bottom: 40px;
+  }
+  h2 {
+    font-size: 20px;
+    margin-top: 40px;
+    margin-bottom: 12px;
+    border-bottom: 2px solid var(--accent);
+    display: inline-block;
+    padding-bottom: 4px;
+  }
+  p, li {
+    color: var(--ink);
+    font-size: 16px;
+  }
+  ul {
+    padding-left: 20px;
+  }
+  li {
+    margin-bottom: 8px;
+  }
+  .callout {
+    background: #f2fdfb;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 24px 0;
+    font-size: 15px;
+  }
+  code {
+    background: #f2f4f7;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  a {
+    color: var(--accent);
+  }
+  footer {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Privacy Policy for Qwen Video Factory</h1>
+  <div class="meta">Effective date: [DATE OF FIRST PUBLISH]</div>
+
+  <p>Qwen Video Factory is a Chrome extension that automates bulk prompt submission for video generation on chat.qwen.ai. This policy explains what data it accesses, how it's used, and what is (and isn't) collected.</p>
+
+  <div class="callout">
+    <strong>In short:</strong> Qwen Video Factory runs entirely inside your own browser, on your own chat.qwen.ai account. It does not have a server, does not transmit your prompts or activity anywhere, and does not sell or share data with anyone.
+  </div>
+
+  <h2>What Qwen Video Factory accesses</h2>
+  <p>To do its job — queueing and submitting prompts on your behalf — Qwen Video Factory reads and interacts with the content of the chat.qwen.ai page that you have open. Specifically, it:</p>
+  <ul>
+    <li>Reads the state of the chat.qwen.ai composer, so it knows when a generation has finished and it's safe to submit the next prompt.</li>
+    <li>Types queued prompts into the composer and submits them on your behalf.</li>
+    <li>Reads generated video results so they can be downloaded, if you've enabled Auto Download.</li>
+    <li>Reads chat.qwen.ai's own on-page messaging to detect when your account's daily generation limit has been reached, so the queue can stop cleanly instead of erroring prompt-by-prompt.</li>
+  </ul>
+  <p>This is the only site Qwen Video Factory interacts with. It does not read, monitor, or collect data from any other tab or website you visit.</p>
+
+  <h2>What Qwen Video Factory does <em>not</em> do</h2>
+  <p>Qwen Video Factory does not collect, transmit, or have any means of accessing:</p>
+  <ul>
+    <li>Personally identifiable information (name, email, address, etc.)</li>
+    <li>Authentication credentials or passwords</li>
+    <li>Health, financial, or payment information</li>
+    <li>Your browsing history or activity outside of the chat.qwen.ai tab</li>
+    <li>Location data</li>
+  </ul>
+  <p>It also does not create, manage, or switch between multiple chat.qwen.ai accounts to work around the service's daily generation limit. When that limit is reached, the queue stops and waits for you to resume it once your quota resets.</p>
+
+  <h2>Where your data lives</h2>
+  <p>Qwen Video Factory stores the following locally in your browser only, using Chrome's built-in storage APIs. This data never leaves your device:</p>
+  <ul>
+    <li>Your prompt queue and queue settings (delay range, download folder name, auto-download toggle)</li>
+  </ul>
+  <p>Qwen Video Factory has no backend server. There is nowhere for this data to be sent, because no such destination exists.</p>
+
+  <h2>Permissions Qwen Video Factory uses, and why</h2>
+  <ul>
+    <li><strong>Host permission (chat.qwen.ai):</strong> required to read and interact with the prompt composer — this is the extension's core function.</li>
+    <li><strong>downloads:</strong> used only when you enable Auto Download, to save your own generated videos to a folder you choose.</li>
+    <li><strong>storage:</strong> used to save your queue settings locally, as described above.</li>
+    <li><strong>sidePanel:</strong> used to display the queue controls in Chrome's side panel, so you can monitor and control a running queue.</li>
+  </ul>
+
+  <h2>Sharing and selling of data</h2>
+  <p>Qwen Video Factory does not sell, rent, or transfer any user data to third parties. It does not use data for advertising, profiling, or any purpose unrelated to running your own prompt queue on your own chat.qwen.ai account.</p>
+
+  <h2>Children's privacy</h2>
+  <p>Qwen Video Factory is not directed at, or knowingly used by, children. It is a developer/creator productivity tool intended for adult use in connection with a chat.qwen.ai account.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>If this policy changes, the updated version will be posted at this same URL with a revised effective date. Material changes affecting how your data is handled will also be reflected in Qwen Video Factory's Chrome Web Store listing, if and when it is published there.</p>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy or how Qwen Video Factory handles data can be sent to:<br>
+  <strong><a id="contact-email" href="#">[enable JavaScript to view]</a></strong></p>
+  <script>
+    // Assembled at runtime instead of written as plain text, so basic
+    // regex-based scrapers that just read the raw HTML don't pick this
+    // address up directly.
+    (function () {
+      var user = "nexvistasystems";
+      var domain = "gmail.com";
+      var address = user + "@" + domain;
+      var link = document.getElementById("contact-email");
+      link.href = "mailto:" + address;
+      link.textContent = address;
+    })();
+  </script>
+
+  <footer>
+    Qwen Video Factory is an independent project and is not affiliated with, endorsed by, or produced by Alibaba Cloud or the Qwen team. Qwen&trade; is a trademark of its respective owner.
+  </footer>
+
+</div>
+</body>
+</html>

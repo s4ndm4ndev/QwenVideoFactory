@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>Qwen Video Factory</title>
+		<link rel="stylesheet" href="sidepanel.css" />
+	</head>
+	<body>
+		<div id="scroll-area">
+			<header class="app-header">
+				<span class="logo-mark">▶</span>
+				<h1>Qwen Video Factory</h1>
+			</header>
+
+			<nav class="tab-bar">
+				<button
+					type="button"
+					class="tab-button active"
+					data-tab="controls">
+					Controls
+				</button>
+				<button type="button" class="tab-button" data-tab="about">
+					About
+				</button>
+			</nav>
+
+			<div id="controls-view">
+				<section class="panel">
+					<label for="prompts"
+						>Prompts <span class="hint">one per line</span></label
+					>
+					<textarea
+						id="prompts"
+						placeholder="[video] a red bicycle leaning against a brick wall&#10;a cup of coffee on a wooden desk&#10;[video] a cat chasing a laser pointer&#10;..."></textarea>
+
+					<p class="hint-banner">
+						Prefix a line with <code>[video]</code> to queue it for
+						video generation. Lines without the tag are loaded but
+						skipped — handy for keeping a mixed prompt file without
+						submitting everything in it.
+					</p>
+
+					<div class="file-upload-row">
+						<label for="prompt-file" class="file-upload-label"
+							>Or upload a .txt file</label
+						>
+						<input
+							type="file"
+							id="prompt-file"
+							accept=".txt"
+							class="file-input" />
+					</div>
+
+					<div class="row">
+						<label>Delay between prompts</label>
+						<div class="delay-input">
+							<input
+								type="number"
+								id="delay-min"
+								min="1"
+								value="8" />
+							<span>to</span>
+							<input
+								type="number"
+								id="delay-max"
+								min="1"
+								value="20" />
+							<span>sec</span>
+						</div>
+					</div>
+
+					<div class="row">
+						<label for="auto-download">Auto-download results</label>
+						<label class="switch">
+							<input
+								type="checkbox"
+								id="auto-download"
+								class="toggle-checkbox" />
+							<span class="switch-track"></span>
+						</label>
+					</div>
+
+					<div id="download-settings-hint" class="hint-banner" hidden>
+						If Chrome is set to "Ask where to save each file," every
+						download will pause the queue waiting for a manual
+						click.
+						<button
+							type="button"
+							id="open-download-settings"
+							class="link-button">
+							Check Chrome's download settings
+						</button>
+					</div>
+
+					<div class="folder-field">
+						<label for="download-folder"
+							>Download folder
+							<span class="hint"
+								>optional subfolder in Downloads</span
+							></label
+						>
+						<input
+							type="text"
+							id="download-folder"
+							placeholder="qwen-batch-1"
+							value="qwen-batch-1"
+							disabled />
+					</div>
+
+					<div class="controls">
+						<button id="start" class="primary">Start queue</button>
+						<button id="pause" class="secondary" disabled>
+							Pause
+						</button>
+						<button id="stop" class="secondary" disabled>
+							Stop
+						</button>
+						<button id="clear" class="secondary" disabled>
+							Clear queue
+						</button>
+					</div>
+				</section>
+
+				<section class="panel queue-panel">
+					<div class="queue-header">
+						<h2>Queue</h2>
+						<span id="queue-progress" class="hint">0 / 0</span>
+					</div>
+					<ul id="queue-list"></ul>
+				</section>
+			</div>
+
+			<div id="about-view" hidden>
+				<section class="panel about-panel">
+					<div class="about-brand">
+						<span class="logo-mark">▶</span>
+						<h2>Qwen Video Factory</h2>
+					</div>
+					<dl class="about-meta">
+						<div>
+							<dt>Version</dt>
+							<dd id="about-version">—</dd>
+						</div>
+						<div>
+							<dt>Author</dt>
+							<dd>S4NDM4N</dd>
+						</div>
+						<div>
+							<dt>Web Site</dt>
+							<dd>
+								<button
+									type="button"
+									id="about-website-link"
+									class="link-button">
+									s4ndm4n.dev
+								</button>
+							</dd>
+						</div>
+					</dl>
+				</section>
+			</div>
+		</div>
+
+		<footer class="status-bar">
+			<span id="status-dot" class="dot idle"></span>
+			<span id="status-text"
+				>Idle — open a chat.qwen.ai tab to begin</span
+			>
+		</footer>
+
+		<div
+			id="download-location-notice"
+			class="download-location-notice"
+			hidden>
+			<p>
+				First time here: downloaded videos land wherever Chrome's
+				download folder is set. Check
+				<code>chrome://settings/downloads</code> if you're not sure
+				where to look for them.
+			</p>
+			<button type="button" id="dismiss-download-notice" class="primary">
+				Got it
+			</button>
+		</div>
+
+		<div id="blocking-overlay" class="blocking-overlay" hidden>
+			<div class="blocking-card">
+				<div class="blocking-icon">⚠</div>
+				<h2 id="blocking-title">Not on chat.qwen.ai</h2>
+				<p id="blocking-message">
+					Qwen Video Factory only works when you're on
+					chat.qwen.ai.
+				</p>
+				<button id="blocking-action" class="primary">
+					Navigate to chat.qwen.ai
+				</button>
+			</div>
+		</div>
+
+		<script src="sidepanel.js"></script>
+	</body>
+</html>

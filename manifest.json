@@ -1,0 +1,37 @@
+{
+	"manifest_version": 3,
+	"name": "Qwen Video Factory",
+	"short_name": "Qwen Video Factory",
+	"version": "0.1.0.0",
+	"minimum_chrome_version": "114",
+	"description": "Bulk prompt automation for chat.qwen.ai video generation. Queue prompts, generate in bulk, download the results.",
+	"permissions": ["storage", "downloads", "sidePanel"],
+	"host_permissions": ["https://chat.qwen.ai/*"],
+	"background": {
+		"service_worker": "background.js"
+	},
+	"action": {
+		"default_title": "Qwen Video Factory"
+	},
+	"side_panel": {
+		"default_path": "sidepanel/sidepanel.html"
+	},
+	"content_scripts": [
+		{
+			"matches": ["https://chat.qwen.ai/*"],
+			"js": ["content-scripts/qwen.js"],
+			"run_at": "document_idle"
+		},
+		{
+			"matches": ["https://chat.qwen.ai/*"],
+			"js": ["content-scripts/qwen-main-world.js"],
+			"run_at": "document_idle",
+			"world": "MAIN"
+		}
+	],
+	"icons": {
+		"16": "icons/icon16.png",
+		"48": "icons/icon48.png",
+		"128": "icons/icon128.png"
+	}
+}
