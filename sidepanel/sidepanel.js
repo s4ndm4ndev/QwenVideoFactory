@@ -2,17 +2,13 @@
 //
 // Owns the queue state and drives it forward one prompt at a time, sending
 // each prompt to the content script via background.js and waiting for the
-// result before moving on. Only lines tagged [video] are actually submitted
-// — everything else loads into the queue as "skipped" so a mixed prompt
-// file doesn't need to be split by hand first.
-//
-// Deliberately does NOT retry a different account when chat.qwen.ai reports
-// its daily limit reached — the queue stops cleanly instead, reporting how
-// much got done and how much is left, for the user to resume once their
-// quota resets. See README.md for why.
+// result before moving on. Every non-blank line in the prompts textarea is
+// submitted, in order.
 
 const promptsEl = document.getElementById("prompts");
 const promptFileEl = document.getElementById("prompt-file");
+const accountFileEl = document.getElementById("account-file");
+const accountStatusEl = document.getElementById("account-status");
 const delayMinEl = document.getElementById("delay-min");
 const delayMaxEl = document.getElementById("delay-max");
 const autoDownloadEl = document.getElementById("auto-download");
@@ -41,12 +37,19 @@ const dismissDownloadNoticeBtn = document.getElementById("dismiss-download-notic
 
 const QWEN_TOOL_URL = "https://chat.qwen.ai/";
 const AUTHOR_WEBSITE_URL = "https://s4ndm4n.dev/";
-const VIDEO_TAG_PATTERN = /^\s*\[video\]\s*/i;
 
-let queue = []; // [{ text, tagged, status }]
+let queue = []; // [{ text, status }]
 let currentIndex = -1;
 let running = false;
 let paused = false;
+
+// Accounts loaded from the accounts file, kept in memory only — never
+// written to chrome.storage.local — so plaintext passwords never touch
+// disk. Re-upload the file after closing the panel, same as the prompt
+// queue itself losing progress on close.
+let accounts = []; // [{ email, password, status }] status: unused | active | exhausted | failed
+let activeAccount = null;
+let switchAttempts = 0; // bounds total account switches to accounts.length
 // Auto-pause driven by background.js's QWEN_FOCUS_CHANGED, distinct from the
 // user-controlled `paused` flag above so a manual pause isn't silently
 // cleared by regaining focus, and so a focus-driven pause doesn't flip the
@@ -110,7 +113,6 @@ const STATUS_LABELS = {
 	running: "Generating…",
 	done: "Done ✓",
 	error: "Error",
-	skipped: "Skipped",
 	limit: "Limit reached",
 };
 
@@ -123,23 +125,38 @@ function renderQueue() {
 	queue.forEach((item) => {
 		const li = document.createElement("li");
 		if (item.status === "running") li.classList.add("active");
+
+		const row = document.createElement("div");
+		row.className = "item-row";
 		const dot = document.createElement("span");
 		dot.className = `status-dot ${item.status}`;
 		const text = document.createElement("span");
 		text.className = "item-text";
 		text.textContent = item.text;
-		li.appendChild(dot);
-		li.appendChild(text);
+		row.appendChild(dot);
+		row.appendChild(text);
 
 		const badge = document.createElement("span");
 		badge.className = `status-badge ${item.status}`;
 		badge.textContent = STATUS_LABELS[item.status] || item.status;
-		li.appendChild(badge);
+		row.appendChild(badge);
+		li.appendChild(row);
+
+		// Shown as a persistent second line rather than only in the transient
+		// status bar text, which the next queue event (the inter-prompt
+		// countdown, the next item starting, ...) overwrites within seconds —
+		// too easy to miss when diagnosing why a specific item failed.
+		if ((item.status === "error" || item.status === "limit") && item.error) {
+			const errorLine = document.createElement("div");
+			errorLine.className = "item-error";
+			errorLine.textContent = item.error;
+			li.appendChild(errorLine);
+		}
+
 		queueListEl.appendChild(li);
 	});
-	const taggedItems = queue.filter((q) => q.tagged);
-	const done = taggedItems.filter((q) => q.status === "done").length;
-	queueProgressEl.textContent = `${done} / ${taggedItems.length}`;
+	const done = queue.filter((q) => q.status === "done").length;
+	queueProgressEl.textContent = `${done} / ${queue.length}`;
 	updateClearButton();
 }
 
@@ -166,6 +183,72 @@ promptFileEl.addEventListener("change", () => {
 	};
 	reader.readAsText(file);
 	promptFileEl.value = ""; // allow re-selecting the same file later
+});
+
+/**
+ * Parse an accounts file into a list of { email, password, status }.
+ * Blocks are separated by a blank line, each with a "User name:" and a
+ * "Password:" line (see README.md for the exact format).
+ */
+function parseAccountsFile(text) {
+	return text
+		.replace(/\r\n/g, "\n")
+		.split(/\n\s*\n/)
+		.map((block) => {
+			const email = /^User name:\s*(.+)$/im.exec(block);
+			const password = /^Password:\s*(.+)$/im.exec(block);
+			return email && password
+				? { email: email[1].trim(), password: password[1].trim(), status: "unused" }
+				: null;
+		})
+		.filter(Boolean);
+}
+
+/**
+ * Includes a per-status breakdown (not just "current: X"), so it's possible
+ * to tell, after a batch stops on "Limit reached", whether that's because
+ * every loaded account has now been used and exhausted (nothing left to
+ * rotate to — expected, not a bug) versus something failing partway through
+ * a switch — rather than only showing "current: <email>" and leaving that
+ * question to guesswork.
+ */
+function updateAccountStatusUI() {
+	if (accounts.length === 0) {
+		accountStatusEl.textContent = "No accounts loaded — daily limit will stop the queue.";
+		return;
+	}
+	const active = activeAccount ? activeAccount.email : "none active";
+	const counts = accounts.reduce((acc, a) => {
+		acc[a.status] = (acc[a.status] || 0) + 1;
+		return acc;
+	}, {});
+	const breakdown = Object.entries(counts)
+		.map(([status, count]) => `${count} ${status}`)
+		.join(", ");
+	accountStatusEl.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"} loaded — current: ${active} (${breakdown}).`;
+}
+
+accountFileEl.addEventListener("change", () => {
+	const file = accountFileEl.files[0];
+	if (!file) return;
+
+	const reader = new FileReader();
+	reader.onload = () => {
+		accounts = parseAccountsFile(String(reader.result));
+		// Not assumed to be accounts[0]: whatever account is actually logged
+		// into the chat.qwen.ai tab right now isn't necessarily the first (or
+		// any) entry in this file — the extension never checks who's really
+		// logged in. Leaving activeAccount null (and every loaded account
+		// "unused") means the first daily-limit hit correctly rotates to
+		// accounts[0], instead of tryRotateToNextAccount() treating an
+		// unrelated already-logged-in account as if it were accounts[0] and
+		// skipping straight to accounts[1].
+		activeAccount = null;
+		switchAttempts = 0;
+		updateAccountStatusUI();
+	};
+	reader.readAsText(file);
+	accountFileEl.value = ""; // allow re-selecting the same file later
 });
 
 /**
@@ -212,9 +295,10 @@ function downloadResult(resultData, index) {
 			},
 			(response) => {
 				clearTimeout(timeout);
+				const lastError = chrome.runtime.lastError;
 				if (!response || !response.ok) {
 					setStatus(
-						`Download failed: ${(response && response.error) || "no response from background"}`,
+						`Download failed: ${(response && response.error) || (lastError && lastError.message) || "no response from background"}`,
 						"error",
 					);
 				}
@@ -256,8 +340,12 @@ function sleep(ms) {
 function sendToContent(type, payload) {
 	return new Promise((resolve) => {
 		chrome.runtime.sendMessage({ target: "content", type, payload }, (response) => {
+			const lastError = chrome.runtime.lastError;
 			resolve(
-				response || { ok: false, error: "No response — is a chat.qwen.ai tab open?" },
+				response || {
+					ok: false,
+					error: (lastError && lastError.message) || "No response — is a chat.qwen.ai tab open?",
+				},
 			);
 		});
 	});
@@ -268,10 +356,84 @@ function refreshQwenTab() {
 		chrome.runtime.sendMessage(
 			{ target: "background", type: "REFRESH_QWEN_TAB" },
 			(response) => {
-				resolve(response || { ok: false, error: "No response from background script." });
+				const lastError = chrome.runtime.lastError;
+				resolve(
+					response || {
+						ok: false,
+						error: (lastError && lastError.message) || "No response from background script.",
+					},
+				);
 			},
 		);
 	});
+}
+
+function switchAccount(account) {
+	return new Promise((resolve) => {
+		chrome.runtime.sendMessage(
+			{
+				target: "background",
+				type: "SWITCH_ACCOUNT",
+				payload: { email: account.email, password: account.password },
+			},
+			(response) => {
+				const lastError = chrome.runtime.lastError;
+				resolve(
+					response || {
+						ok: false,
+						error: (lastError && lastError.message) || "No response from background script.",
+					},
+				);
+			},
+		);
+	});
+}
+
+/**
+ * Log the exhausted account out of rotation and log the next unused one in,
+ * via background.js's SWITCH_ACCOUNT orchestration. Bounded by
+ * switchAttempts so a run of bad credentials can't loop forever — each
+ * account gets at most one attempt per queue run.
+ */
+async function tryRotateToNextAccount(submittedCount) {
+	// Marked exhausted unconditionally, before checking whether there's
+	// anywhere left to rotate to — this function only ever gets called
+	// because the current account just hit its real daily limit, so that's
+	// true regardless of whether a next account exists. Previously this only
+	// ran in the branch below (after confirming a next account was found),
+	// so the account actually in use when the queue finally ran out of
+	// accounts stayed mislabeled "active" forever — reading as a switch that
+	// silently failed rather than what it actually was: correctly running out
+	// of loaded accounts.
+	if (activeAccount) activeAccount.status = "exhausted";
+
+	const next = accounts.find((a) => a.status === "unused");
+	if (!next || switchAttempts >= accounts.length) {
+		updateAccountStatusUI(); // reflect the final exhausted/failed breakdown, not a stale earlier one
+		return { ok: false, finalMessage: buildExhaustionSummary(submittedCount, queue.length) };
+	}
+	switchAttempts++;
+	updateAccountStatusUI();
+	setStatus(
+		`Daily limit reached${activeAccount ? ` on ${activeAccount.email}` : ""} — switching to ${next.email}...`,
+		"running",
+	);
+	const result = await switchAccount(next);
+	if (!result.ok) {
+		next.status = "failed";
+		updateAccountStatusUI();
+		return tryRotateToNextAccount(submittedCount);
+	}
+	next.status = "active";
+	activeAccount = next;
+	updateAccountStatusUI();
+	return { ok: true };
+}
+
+function buildExhaustionSummary(submittedCount, total) {
+	return accounts.length
+		? `All ${accounts.length} loaded accounts exhausted or failed to log in — ${submittedCount} of ${total} prompts completed.`
+		: `Daily limit reached — ${submittedCount} of ${total} submitted. Resume once your quota resets, or load an accounts file to rotate automatically.`;
 }
 
 /**
@@ -346,6 +508,17 @@ async function delayWithCountdown() {
 async function runQueue() {
 	running = true;
 	paused = false;
+	// tryRotateToNextAccount()'s own comment says each account gets "at most
+	// one attempt per queue run," but switchAttempts was only ever reset on
+	// re-uploading the accounts file — never here — so across many Start/Stop
+	// cycles in the same panel session (exactly today's testing pattern) it
+	// kept accumulating, capable of blocking a rotation to a genuinely
+	// `"unused"` account just because an earlier, unrelated run had already
+	// used up the budget. Reset per run to match the stated intent; each
+	// account's own status (exhausted/failed/active/unused) is untouched by
+	// this and still correctly blocks rotating to an account that's actually
+	// out of accounts, not just out of attempts.
+	switchAttempts = 0;
 	startBtn.disabled = true;
 	pauseBtn.disabled = false;
 	stopBtn.disabled = false;
@@ -366,10 +539,9 @@ async function runQueue() {
 		return;
 	}
 
-	const taggedCount = queue.filter((q) => q.tagged).length;
 	let submittedCount = 0;
 
-	for (let i = 0; i < queue.length; i++) {
+	for (let i = 0; i < queue.length; ) {
 		if (!running) break;
 		while (paused || focusPaused) {
 			await sleep(300);
@@ -377,26 +549,44 @@ async function runQueue() {
 		}
 		if (!running) break;
 
-		if (!queue[i].tagged || queue[i].status === "done") continue; // untagged, or already completed in a prior run
+		if (queue[i].status === "done") {
+			i++;
+			continue; // already completed in a prior run
+		}
 
 		currentIndex = i;
 		queue[i].status = "running";
 		renderQueue();
-		setStatus(`Running ${submittedCount + 1} of ${taggedCount}...`, "running");
+		setStatus(`Running ${submittedCount + 1} of ${queue.length}...`, "running");
 
 		const result = await sendToContent("RUN_PROMPT", { text: queue[i].text });
 
+		// A single RUN_PROMPT can take up to waitForResult()'s 180s timeout to
+		// resolve, and Stop only flips `running` — it doesn't (can't) cancel the
+		// in-flight content-script call. If Stop was clicked while this was
+		// pending, `running` is false by the time we get here; if Clear was
+		// also clicked (Stop leaves it enabled), `queue` itself has been
+		// reassigned to a new, empty array, so `queue[i]` below would be
+		// undefined. Bail out before touching it either way, rather than
+		// crashing on `queue[i].status = ...`.
+		if (!running) break;
+
 		if (result.ok && result.dailyLimitReached) {
+			const switched = await tryRotateToNextAccount(submittedCount);
+			if (switched.ok) {
+				queue[i].status = "pending"; // never actually accepted — retry it on the new account
+				renderQueue();
+				continue; // don't advance i
+			}
 			queue[i].status = "limit";
+			queue[i].error = switched.finalMessage;
 			renderQueue();
-			setStatus(
-				`Daily limit reached — ${submittedCount} of ${taggedCount} submitted. Resume once your quota resets.`,
-				"error",
-			);
+			setStatus(switched.finalMessage, "error");
 			break;
 		}
 
 		queue[i].status = result.ok ? "done" : "error";
+		queue[i].error = result.ok ? null : result.error;
 		renderQueue();
 
 		if (!result.ok) {
@@ -406,14 +596,13 @@ async function runQueue() {
 			if (autoDownloadEl.checked) await downloadResult(result.result, i);
 		}
 
-		// No point counting down a delay after the last tagged prompt, or if
-		// every remaining tagged item is already done.
-		const hasMoreWork = queue
-			.slice(i + 1)
-			.some((item) => item.tagged && item.status !== "done");
+		// No point counting down a delay after the last prompt, or if every
+		// remaining item is already done.
+		const hasMoreWork = queue.slice(i + 1).some((item) => item.status !== "done");
 		if (running && hasMoreWork) {
 			await delayWithCountdown();
 		}
+		i++;
 	}
 
 	if (running) {
@@ -486,17 +675,16 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 startBtn.addEventListener("click", () => {
-	// If the current queue still has unfinished tagged items (stopped
-	// partway through, hit the daily limit, or a prompt errored out), resume
-	// it in place rather than rebuilding from the textarea and losing track
-	// of what's already done. Only load a fresh queue from the textarea once
-	// everything tagged in the current one is done (or there's no queue yet).
-	const hasUnfinishedWork =
-		queue.length > 0 && queue.some((item) => item.tagged && item.status !== "done");
+	// If the current queue still has unfinished items (stopped partway
+	// through, hit the daily limit, or a prompt errored out), resume it in
+	// place rather than rebuilding from the textarea and losing track of
+	// what's already done. Only load a fresh queue from the textarea once
+	// everything in the current one is done (or there's no queue yet).
+	const hasUnfinishedWork = queue.length > 0 && queue.some((item) => item.status !== "done");
 
 	if (hasUnfinishedWork) {
 		queue.forEach((item) => {
-			if (item.tagged && item.status !== "done") item.status = "pending";
+			if (item.status !== "done") item.status = "pending";
 		});
 	} else {
 		const lines = promptsEl.value
@@ -509,17 +697,7 @@ startBtn.addEventListener("click", () => {
 			return;
 		}
 
-		queue = lines.map((line) => {
-			const tagged = VIDEO_TAG_PATTERN.test(line);
-			const text = line.replace(VIDEO_TAG_PATTERN, "");
-			return { text, tagged, status: tagged ? "pending" : "skipped" };
-		});
-
-		if (queue.every((item) => !item.tagged)) {
-			setStatus("No [video]-tagged prompts found in the list.", "error");
-			renderQueue();
-			return;
-		}
+		queue = lines.map((line) => ({ text: line, status: "pending" }));
 	}
 
 	renderQueue();

@@ -157,6 +157,113 @@ function reloadTabAndWait(tabId, timeoutMs = 30000) {
 	});
 }
 
+/**
+ * Poll the content script's PING until `check` returns true for its
+ * response, or reject after timeoutMs. Shared by the two poll phases in
+ * switchAccountAndWait() below — waiting for the login form to appear after
+ * logout, and waiting for the composer to reappear after login.
+ */
+function pollUntil(tabId, check, timeoutMs, timeoutMessage) {
+	return new Promise((resolve, reject) => {
+		const start = Date.now();
+		function poll() {
+			chrome.tabs.sendMessage(tabId, { target: "content", type: "PING" }, (response) => {
+				void chrome.runtime.lastError; // content script not injected yet — expected during navigation
+				if (response && response.ok && check(response)) {
+					resolve();
+					return;
+				}
+				if (Date.now() - start > timeoutMs) {
+					reject(new Error(timeoutMessage));
+					return;
+				}
+				setTimeout(poll, 300);
+			});
+		}
+		poll();
+	});
+}
+
+/**
+ * Orchestrate a full account switch: log the current account out, navigate
+ * to the login page, log the next account in, and wait for the composer to
+ * reappear.
+ *
+ * Confirmed live: clicking "Log out" does NOT navigate anywhere by itself —
+ * the page just re-renders the same URL in a logged-out state. The actual
+ * login form lives at a distinct URL, https://chat.qwen.ai/auth, so this
+ * navigates there directly (via chrome.tabs.update) rather than having the
+ * content script hunt for a "Log in" button to click. That navigation does
+ * unload and re-inject the content script the same way a reload does, which
+ * is why this waits for tabs.onUpdated "complete" before polling, mirroring
+ * reloadTabAndWait()'s pattern.
+ */
+function switchAccountAndWait(tabId, { email, password }, timeoutMs = 45000) {
+	return new Promise((resolve, reject) => {
+		chrome.tabs.sendMessage(tabId, { target: "content", type: "PERFORM_LOGOUT" }, (logoutResponse) => {
+			if (chrome.runtime.lastError || !logoutResponse || !logoutResponse.ok) {
+				reject(
+					new Error(
+						(logoutResponse && logoutResponse.error) ||
+							(chrome.runtime.lastError && chrome.runtime.lastError.message) ||
+							"Logout failed.",
+					),
+				);
+				return;
+			}
+
+			function onAuthPageLoaded(updatedTabId, changeInfo) {
+				if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
+				chrome.tabs.onUpdated.removeListener(onAuthPageLoaded);
+				proceedAfterNavigation();
+			}
+			chrome.tabs.onUpdated.addListener(onAuthPageLoaded);
+			chrome.tabs.update(tabId, { url: "https://chat.qwen.ai/auth" });
+
+			function proceedAfterNavigation() {
+				pollUntil(
+					tabId,
+					(r) => r.loginFormReady,
+					timeoutMs,
+					"Timed out waiting for the login form to appear after logging out.",
+				)
+				.then(
+					() =>
+						new Promise((res, rej) => {
+							chrome.tabs.sendMessage(
+								tabId,
+								{ target: "content", type: "PERFORM_LOGIN", payload: { email, password } },
+								(loginResponse) => {
+									if (chrome.runtime.lastError || !loginResponse || !loginResponse.ok) {
+										rej(
+											new Error(
+												(loginResponse && loginResponse.error) ||
+													(chrome.runtime.lastError && chrome.runtime.lastError.message) ||
+													"Login failed.",
+											),
+										);
+										return;
+									}
+									res();
+								},
+							);
+						}),
+				)
+				.then(() =>
+					pollUntil(
+						tabId,
+						(r) => r.composerReady,
+						timeoutMs,
+						"Timed out waiting for chat.qwen.ai to become ready after logging in.",
+					),
+				)
+				.then(resolve)
+				.catch(reject);
+			}
+		});
+	});
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 	if (message.target === "background" && message.type === "DOWNLOAD_RESULT") {
 		const { url, folder, baseIndex } = message.payload;
@@ -199,6 +306,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 		return true; // async response
 	}
 
+	if (message.target === "background" && message.type === "SWITCH_ACCOUNT") {
+		findActiveQwenTab().then(({ tab, error }) => {
+			if (!tab) {
+				sendResponse({ ok: false, error });
+				return;
+			}
+			switchAccountAndWait(tab.id, message.payload)
+				.then(() => sendResponse({ ok: true }))
+				.catch((err) => sendResponse({ ok: false, error: err.message }));
+		});
+		return true; // async response
+	}
+
 	if (message.target === "content") {
 		// Forward the command only to the currently active tab in the focused
 		// window, and only if that tab is actually chat.qwen.ai. A qwen tab
@@ -211,6 +331,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 				return;
 			}
 			chrome.tabs.sendMessage(tab.id, message, (response) => {
+				if (chrome.runtime.lastError) {
+					sendResponse({
+						ok: false,
+						error:
+							chrome.runtime.lastError.message ||
+							"Could not reach the content script — try reloading the chat.qwen.ai tab.",
+					});
+					return;
+				}
 				sendResponse(response);
 			});
 		});

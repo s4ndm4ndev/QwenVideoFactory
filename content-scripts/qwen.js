@@ -22,29 +22,22 @@
 //      to work live.
 
 /**
- * Find the prompt composer on the page.
- * TODO: confirm the real selector via live inspection. Placeholder guesses
- * a plain textarea with a placeholder mentioning "message" or "prompt" —
- * verify and replace with something stable (data-testid, aria-label, etc).
+ * Find the prompt composer on the page. Confirmed live: a plain <textarea
+ * class="message-input-textarea ...">, no framework-controlled rich-text
+ * editor — setPromptText()'s native-setter approach is sufficient, the
+ * MAIN-world bridge (qwen-main-world.js) is not needed for this field.
  */
 function findPromptInput() {
-	return document.querySelector("textarea");
+	return document.querySelector("textarea.message-input-textarea");
 }
 
 /**
- * Find the submit button next to the prompt composer.
- * TODO: confirm the real selector via live inspection.
+ * Find the submit button next to the prompt composer. Confirmed live:
+ * <button aria-label="Send" class="send-button">, which only renders once
+ * the composer has text in it (absent while the textarea is empty).
  */
 function findGenerateButton() {
-	const input = findPromptInput();
-	if (!input) return null;
-	let container = input.parentElement;
-	while (container) {
-		const button = container.querySelector('button[type="submit"]');
-		if (button) return button;
-		container = container.parentElement;
-	}
-	return null;
+	return document.querySelector('button[aria-label="Send"]');
 }
 
 /**
@@ -70,25 +63,189 @@ function setPromptText(text) {
 
 /**
  * Whether chat.qwen.ai's video-generation mode/tool is currently selected.
- * TODO: confirm the real DOM signal via live inspection — this gates the
- * "only submit prompts tagged [video]" feature (see runPrompt() and the
- * queue-tagging logic in sidepanel/sidepanel.js): a prompt tagged for video
- * generation should only be submitted once this is actually on.
+ * Confirmed live: selecting "Create Video" from the "+" tools menu renders a
+ * <div class="mode-select"><div class="mode-select-current-mode"><span>Create
+ * Video</span>...</div></div> pill next to the composer; it's absent (or
+ * shows a different mode's name) otherwise.
  */
 function isVideoModeOn() {
-	return true;
+	const current = document.querySelector(".mode-select-current-mode");
+	return !!current && current.textContent.includes("Create Video");
 }
 
 /**
- * Look for chat.qwen.ai's own "daily limit reached" message on the page.
- * TODO: confirm the actual error text/selector via live inspection — this
- * is the signal the queue uses to stop gracefully instead of erroring
- * prompt-by-prompt (see RUN_PROMPT below and runQueue() in sidepanel.js).
+ * Turn on "Create Video" mode if it isn't already active. Confirmed live:
+ * the "+" trigger next to the composer (<div aria-label="Select Mode"
+ * class="mode-select-open">, always present alongside whatever mode pill is
+ * currently selected) opens an Ant Design dropdown; its "Create Video" entry
+ * is <li role="menuitem" class="... mode-select-common-item">. Selecting it
+ * replaces/adds the "Create Video" pill (`.mode-select-current-mode`) that
+ * isVideoModeOn() checks for. No-ops if video mode is already on, since a
+ * fresh chat likely needs this every time but a mid-conversation call
+ * shouldn't re-trigger it needlessly.
+ */
+async function enableVideoMode() {
+	if (isVideoModeOn()) return;
+
+	// Waited for (not just queried once) because background.js's post-reload
+	// readiness check only confirms the prompt textarea has mounted
+	// (composerReady), not the rest of the composer toolbar — right after the
+	// queue's start-of-batch reload, the textarea can appear a beat before
+	// this trigger does, and a same-tick querySelector here would throw on
+	// the very first prompt even though the page is genuinely still loading,
+	// not actually broken.
+	const trigger = await waitFor(
+		() => document.querySelector('[aria-label="Select Mode"]'),
+		20000,
+		200,
+	);
+	if (!trigger) throw new Error("Could not find the mode-select trigger on the page.");
+	trigger.click();
+
+	// Same post-reload slowness as the trigger wait above applies here too —
+	// confirmed live: the trigger was found and the menu item below was found
+	// and clicked successfully, but the confirmation pill still took longer
+	// than 3s to actually render under that load, throwing this function's
+	// last error even though every step up to it had genuinely worked.
+	// Widened to match the trigger wait instead of leaving these tighter.
+	const item = await waitFor(
+		() =>
+			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
+				li.textContent.includes("Create Video"),
+			),
+		20000,
+		200,
+	);
+	if (!item) throw new Error("Could not find the 'Create Video' option in the mode menu.");
+	item.click();
+
+	const enabled = await waitFor(isVideoModeOn, 20000, 200);
+	if (!enabled) throw new Error("Selected 'Create Video' but video mode did not turn on.");
+}
+
+/**
+ * Look for chat.qwen.ai's own "daily usage limit" message on the page.
+ * Confirmed live (screenshot) to appear in two places, both containing the
+ * phrase "daily usage limit": a page-level banner ("You have reached the
+ * daily usage limit. Please wait 19 hours before trying again.") and an
+ * inline chat-bubble error ("Oops! There was an issue connecting to
+ * Qwen3.7-Plus. You have reached the daily usage limit..."). A single
+ * document.body.innerText scan catches either placement, so no
+ * selector-specific handling is needed for this part — this is the signal
+ * the queue uses to trigger an account switch (or stop gracefully if none
+ * are available) instead of erroring prompt-by-prompt (see RUN_PROMPT below
+ * and runQueue()/tryRotateToNextAccount() in sidepanel.js).
  */
 function findDailyLimitMessage() {
 	const text = document.body.innerText || "";
-	if (/daily limit/i.test(text)) return text.match(/[^.\n]*daily limit[^.\n]*/i)[0];
+	if (/daily usage limit/i.test(text)) return text.match(/[^.\n]*daily usage limit[^.\n]*/i)[0];
 	return null;
+}
+
+/**
+ * Find the "Log out" item inside the account menu (bottom-left profile
+ * button). Confirmed live: opening <button class="user-menu-btn"> (no
+ * aria-label) renders a dropdown with rows
+ * <div class="user-menu-dropdown-item">...<div
+ * class="user-menu-dropdown-item-text">Log out</div></div> — this only
+ * finds the item, it doesn't open the menu first (see performLogout()).
+ */
+function findLogoutControl() {
+	const items = document.querySelectorAll(".user-menu-dropdown-item");
+	return Array.from(items).find((item) => item.textContent.includes("Log out")) || null;
+}
+
+/**
+ * Open the account menu (if not already open) and click "Log out". Confirmed
+ * live: this does NOT navigate anywhere — the page stays on the same URL and
+ * just re-renders into its logged-out state (composer becomes a generic
+ * placeholder, "Log in"/"Sign up" buttons appear top-right instead of the
+ * account menu). The actual login form lives at a distinct URL
+ * (https://chat.qwen.ai/auth), which background.js's switchAccountAndWait()
+ * navigates to directly after this resolves, rather than this function
+ * hunting for a "Log in" button to click.
+ */
+async function performLogout() {
+	if (!findLogoutControl()) {
+		const trigger = document.querySelector("button.user-menu-btn");
+		if (!trigger) throw new Error("Could not find the account menu button on the page.");
+		trigger.click();
+	}
+
+	const control = await waitFor(findLogoutControl, 3000, 150);
+	if (!control) throw new Error("Could not find the logout control on the page.");
+	control.click();
+}
+
+/**
+ * Find the login form's email and password inputs, and its submit button.
+ * Confirmed live at https://chat.qwen.ai/auth: an Ant Design form with
+ * <input name="email"> and <input name="password" type="password">, and a
+ * <button type="submit" class="... qwenchat-auth-pc-submit-button ...">
+ * ("Sign in") that carries a "disabled" class/attribute until both fields
+ * hold a value the framework recognizes as filled in.
+ */
+function findLoginEmailInput() {
+	return document.querySelector('input[name="email"]');
+}
+
+function findLoginPasswordInput() {
+	return document.querySelector('input[name="password"]');
+}
+
+function findLoginSubmitButton() {
+	return document.querySelector("button.qwenchat-auth-pc-submit-button");
+}
+
+/**
+ * Whether the login form is currently on screen — used by the PING handler
+ * so background.js can tell "still on the login page" apart from "composer
+ * is back" while polling through an account switch.
+ */
+function isLoginFormPresent() {
+	return !!(findLoginEmailInput() && findLoginPasswordInput());
+}
+
+/**
+ * Fill in and submit the login form with the given credentials. Confirmed
+ * live end-to-end, including a real submission: the native-setter +
+ * 'input'-event approach below (mirroring setPromptText() above) is enough
+ * to fill both fields, and a plain synthetic submit.click() — no trusted
+ * click via chrome.debugger needed — logged straight in with no CAPTCHA
+ * shown, landing back on the composer. The MAIN-world bridge is not needed
+ * for this form.
+ *
+ * A CAPTCHA remains possible for other accounts/circumstances (rate-limited
+ * IPs, flagged accounts, etc.) even though none appeared during testing —
+ * if one does appear after submitting, this must resolve
+ * { ok: false, error } rather than attempt to interact with or bypass it.
+ * That's a hard stop for that account, not a selector problem to iterate
+ * on.
+ */
+async function performLogin(email, password) {
+	const emailInput = findLoginEmailInput();
+	const passwordInput = findLoginPasswordInput();
+	if (!emailInput || !passwordInput) {
+		throw new Error("Could not find the login form on the page.");
+	}
+
+	const setNativeValue = (el, value) => {
+		const nativeSetter = Object.getOwnPropertyDescriptor(
+			Object.getPrototypeOf(el),
+			"value",
+		).set;
+		nativeSetter.call(el, value);
+		el.dispatchEvent(new Event("input", { bubbles: true }));
+	};
+
+	setNativeValue(emailInput, email);
+	setNativeValue(passwordInput, password);
+
+	await sleep(300 + Math.random() * 500);
+
+	const submit = findLoginSubmitButton();
+	if (!submit) throw new Error("Could not find the login submit button.");
+	submit.click();
 }
 
 /**
@@ -114,35 +271,58 @@ function waitFor(check, timeoutMs, intervalMs = 300) {
 }
 
 /**
- * Watch for a finished video result appearing on the page.
- * TODO: confirm the real completion signal via live inspection — likely a
- * <video> tag gaining a real `src`, or a download/share control appearing
- * next to the generated result. Placeholder polls for any <video> element
- * with a populated src that wasn't there when generation started.
+ * Watch for either a finished video result or the daily-limit message,
+ * whichever appears first. Confirmed live (via DOM inspection of a completed
+ * generation): a finished result does NOT render as a <video> element — it's
+ * a poster/thumbnail, <div class="qwen-video-control"><img class="video-cover"
+ * src="..." />...<div class="qwen-video-control-time">00:05</div></div>, with
+ * the actual <video> only mounting later if the user clicks play. Watches for
+ * a new `.qwen-video-control img.video-cover` (one with a real src that
+ * wasn't already on the page when generation started).
+ *
+ * Previously the daily-limit message was only checked in a separate, fixed
+ * 5-second poll right after submitting, before this function was ever
+ * called — if Qwen's own limit response took longer than that to actually
+ * render (server/UI latency), it was missed entirely and this function's
+ * full timeout ran out blind, waiting on a video that was never going to
+ * arrive. Checking both conditions on the same observer removes that fixed
+ * window: whichever shows up first, any time before the overall timeout,
+ * wins.
  */
 function waitForResult(timeoutMs = 180000) {
 	const alreadyPresent = new Set(
-		Array.from(document.querySelectorAll("video")).map((v) => v.currentSrc || v.src),
+		Array.from(document.querySelectorAll(".qwen-video-control img.video-cover")).map(
+			(img) => img.src,
+		),
 	);
 
 	return new Promise((resolve, reject) => {
-		const timeout = setTimeout(() => {
+		const finish = (fn) => {
+			clearTimeout(timeout);
 			observer.disconnect();
-			reject(new Error("Timed out waiting for the video to finish generating."));
+			fn();
+		};
+
+		const timeout = setTimeout(() => {
+			finish(() => reject(new Error("Timed out waiting for the video to finish generating.")));
 		}, timeoutMs);
 
-		const observer = new MutationObserver(() => {
-			const video = Array.from(document.querySelectorAll("video")).find((v) => {
-				const src = v.currentSrc || v.src;
-				return src && !alreadyPresent.has(src);
-			});
-			if (video) {
-				clearTimeout(timeout);
-				observer.disconnect();
-				resolve(extractResult(video));
+		const check = () => {
+			const limitMessage = findDailyLimitMessage();
+			if (limitMessage) {
+				finish(() => resolve({ dailyLimitReached: true, message: limitMessage }));
+				return;
 			}
-		});
+			const cover = Array.from(
+				document.querySelectorAll(".qwen-video-control img.video-cover"),
+			).find((img) => img.src && !alreadyPresent.has(img.src));
+			if (cover) {
+				finish(() => resolve({ dailyLimitReached: false, result: extractResult(cover) }));
+			}
+		};
 
+		check(); // catches a limit message that's already on the page by the time this starts
+		const observer = new MutationObserver(check);
 		observer.observe(document.body, {
 			childList: true,
 			subtree: true,
@@ -152,15 +332,20 @@ function waitForResult(timeoutMs = 180000) {
 }
 
 /**
- * Pull the downloadable URL out of a finished video element.
- * TODO: confirm live whether this is a same-origin URL fetchable directly by
- * chrome.downloads.download() (as Overflow found for Flow), or a page-scoped
- * blob: URL that would need fetching here and relaying as a data: URL
- * instead.
+ * Pull the downloadable video URL out of a finished result's cover image.
+ * Confirmed live: the cover <img>'s src IS the video's own URL (same path,
+ * same signed `key` query param), with an extra `x-oss-process=video/
+ * snapshot,...` param appended that tells the CDN to serve a jpg frame
+ * instead of the video itself. Stripping that param off gives back a
+ * same-origin, directly downloadable URL — not a page-scoped blob: URL, so
+ * chrome.downloads.download() can use it as-is (same as Overflow found for
+ * Google Flow).
  */
-function extractResult(videoEl) {
+function extractResult(coverImg) {
+	const url = new URL(coverImg.src);
+	url.searchParams.delete("x-oss-process");
 	return {
-		url: videoEl.currentSrc || videoEl.src,
+		url: url.toString(),
 		mediaType: "video",
 	};
 }
@@ -171,9 +356,10 @@ function sleep(ms) {
 
 /**
  * Run a single prompt end-to-end: fill in the text, submit, wait for
- * result. Checks for the daily-limit message before and after submitting so
- * the queue can stop cleanly rather than treating a limit hit as a generic
- * per-prompt error.
+ * result. Checks for the daily-limit message before submitting (in case it's
+ * already on the page from a prior prompt) and relies on waitForResult() to
+ * keep watching for it afterward too, so the queue can stop cleanly rather
+ * than treating a limit hit as a generic per-prompt error.
  */
 async function runPrompt(text) {
 	const preExisting = findDailyLimitMessage();
@@ -183,9 +369,7 @@ async function runPrompt(text) {
 
 	const input = findPromptInput();
 	if (!input) throw new Error("Could not find the prompt input on the page.");
-	if (!isVideoModeOn()) {
-		throw new Error("Video generation mode isn't selected on the page.");
-	}
+	await enableVideoMode();
 
 	setPromptText(text);
 
@@ -194,17 +378,23 @@ async function runPrompt(text) {
 	// field is filled (same rationale as Overflow's flow.js).
 	await sleep(400 + Math.random() * 900);
 
+	// Re-check right before submitting rather than trusting enableVideoMode()'s
+	// earlier confirmation: on a brand-new chat (no session yet, composer's
+	// very first render), typing the prompt text has been observed to redraw
+	// the composer — the aspect-ratio control that only appears once "Create
+	// Video" is on mounts around here — and that redraw can silently drop the
+	// mode pill back to nothing, so the prompt goes out as a normal text chat
+	// instead of a video generation with no error raised anywhere. Re-assert
+	// it here, at the last moment before clicking Send.
+	if (!isVideoModeOn()) {
+		await enableVideoMode();
+	}
+
 	const button = findGenerateButton();
 	if (!button) throw new Error("Could not find the submit button.");
 	button.click();
 
-	const limitAfterSubmit = await waitFor(findDailyLimitMessage, 5000, 500);
-	if (limitAfterSubmit) {
-		return { dailyLimitReached: true, message: limitAfterSubmit };
-	}
-
-	const result = await waitForResult();
-	return { dailyLimitReached: false, result };
+	return waitForResult();
 }
 
 // Listen for commands from the side panel (relayed via background.js).
@@ -214,11 +404,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 	if (message.type === "PING") {
 		// composerReady lets background.js's post-reload wait confirm the page
 		// has actually mounted the prompt input, rather than guessing with a
-		// fixed delay after the page's load event.
+		// fixed delay after the page's load event. loginFormReady does the same
+		// for switchAccountAndWait()'s wait on the login page appearing.
 		sendResponse({
 			ok: true,
 			videoModeOn: isVideoModeOn(),
 			composerReady: !!findPromptInput(),
+			loginFormReady: isLoginFormPresent(),
 			dailyLimitReached: !!findDailyLimitMessage(),
 		});
 		return;
@@ -227,6 +419,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 	if (message.type === "RUN_PROMPT") {
 		runPrompt(message.payload.text)
 			.then((result) => sendResponse({ ok: true, ...result }))
+			.catch((err) => sendResponse({ ok: false, error: err.message }));
+		return true; // async response
+	}
+
+	if (message.type === "PERFORM_LOGOUT") {
+		performLogout()
+			.then(() => sendResponse({ ok: true }))
+			.catch((err) => sendResponse({ ok: false, error: err.message }));
+		return true; // async response
+	}
+
+	if (message.type === "PERFORM_LOGIN") {
+		performLogin(message.payload.email, message.payload.password)
+			.then(() => sendResponse({ ok: true }))
 			.catch((err) => sendResponse({ ok: false, error: err.message }));
 		return true; // async response
 	}

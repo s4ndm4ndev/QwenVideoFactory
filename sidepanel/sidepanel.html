@@ -31,14 +31,7 @@
 					>
 					<textarea
 						id="prompts"
-						placeholder="[video] a red bicycle leaning against a brick wall&#10;a cup of coffee on a wooden desk&#10;[video] a cat chasing a laser pointer&#10;..."></textarea>
-
-					<p class="hint-banner">
-						Prefix a line with <code>[video]</code> to queue it for
-						video generation. Lines without the tag are loaded but
-						skipped — handy for keeping a mixed prompt file without
-						submitting everything in it.
-					</p>
+						placeholder="a red bicycle leaning against a brick wall&#10;a cup of coffee on a wooden desk&#10;a cat chasing a laser pointer&#10;..."></textarea>
 
 					<div class="file-upload-row">
 						<label for="prompt-file" class="file-upload-label"
@@ -50,6 +43,20 @@
 							accept=".txt"
 							class="file-input" />
 					</div>
+
+					<div class="file-upload-row">
+						<label for="account-file" class="file-upload-label"
+							>Load accounts file (optional)</label
+						>
+						<input
+							type="file"
+							id="account-file"
+							accept=".txt"
+							class="file-input" />
+					</div>
+					<p id="account-status" class="hint-banner">
+						No accounts loaded — daily limit will stop the queue.
+					</p>
 
 					<div class="row">
 						<label>Delay between prompts</label>

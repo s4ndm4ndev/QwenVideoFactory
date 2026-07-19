@@ -415,8 +415,8 @@ button.primary:hover:not(:disabled) {
 
 #queue-list li {
 	display: flex;
-	align-items: center;
-	gap: 8px;
+	flex-direction: column;
+	gap: 4px;
 	padding: 6px 8px;
 	border-radius: 6px;
 	background: var(--panel);
@@ -430,11 +430,25 @@ button.primary:hover:not(:disabled) {
 	border-left-color: var(--accent);
 }
 
+#queue-list .item-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
 #queue-list .item-text {
 	flex: 1;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
+}
+
+#queue-list .item-error {
+	font-size: 11px;
+	color: var(--error);
+	padding-left: 15px;
+	word-break: break-word;
+	white-space: normal;
 }
 
 .status-dot {

@@ -16,6 +16,10 @@ npm-debug.log*
 *.pem
 *.zip
 
+# Locally-loaded plaintext account credentials — never commit these.
+accounts*.txt
+credentials*.txt
+
 # AI assistant tooling / local instructions — not meant to be shared via git.
 # This repo uses CHANGELOG.md as the cross-session record instead (see its
 # header note); these files are personal/local config for whichever AI tool
