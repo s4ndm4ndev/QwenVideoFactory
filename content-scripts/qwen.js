@@ -21,6 +21,23 @@
 //      first; only reach for the main-world bridge if that's confirmed not
 //      to work live.
 
+// Diagnostic-only: added after a real test hit a total silent hang (no
+// error, no status update — see runPrompt()'s qvfLog() calls below) that none
+// of the existing error tagging caught. These specifically answer a question
+// that determines what kind of fix is even possible: does chat.qwen.ai do a
+// REAL navigation as part of whatever recovery/reset is happening (which
+// would explain a dead message port that never fires chrome.runtime.lastError
+// the way it normally does), or does the visible "back to the landing page"
+// reset happen with no navigation at all (a pure React-internal remount,
+// which is a same-page, same-content-script-instance problem instead)? A
+// real navigation fires beforeunload/pagehide; a same-page remount does not.
+window.addEventListener("beforeunload", () => qvfLog("window beforeunload — a real navigation is happening"));
+window.addEventListener("pagehide", () => qvfLog("window pagehide — a real navigation is happening"));
+window.addEventListener("error", (e) => qvfLog(`window error event: ${e.message}`));
+window.addEventListener("unhandledrejection", (e) =>
+	qvfLog(`window unhandledrejection: ${(e.reason && e.reason.message) || e.reason}`),
+);
+
 /**
  * Find the prompt composer on the page. Confirmed live: a plain <textarea
  * class="message-input-textarea ...">, no framework-controlled rich-text
@@ -48,17 +65,33 @@ function findGenerateButton() {
  * be replaced with a postMessage relay to qwen-main-world.js instead (see
  * that file's header comment, and Overflow's flow.js/flow-main-world.js for
  * the pattern to copy).
+ *
+ * Types character by character (each with its own native-setter call + a
+ * fresh 'input' event) with a small randomized per-character delay, rather
+ * than setting the whole string in a single call — requested after real
+ * testing showed the automation moving faster than a real user would type,
+ * and one incidental benefit: a single big value-set + one 'input' event is
+ * a more distinctive, all-at-once signal than a real user's per-keystroke
+ * pattern, so spreading it out is a small step toward not looking like a
+ * script even though it wasn't confirmed to be the direct cause of any
+ * specific failure.
  */
-function setPromptText(text) {
+async function setPromptText(text) {
 	const input = findPromptInput();
-	if (!input) throw new Error("Could not find the prompt input on the page.");
+	if (!input) throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
 
 	const nativeSetter = Object.getOwnPropertyDescriptor(
 		window.HTMLTextAreaElement.prototype,
 		"value",
 	).set;
-	nativeSetter.call(input, text);
-	input.dispatchEvent(new Event("input", { bubbles: true }));
+
+	let typed = "";
+	for (const char of text) {
+		typed += char;
+		nativeSetter.call(input, typed);
+		input.dispatchEvent(new Event("input", { bubbles: true }));
+		await sleep(15 + Math.random() * 35);
+	}
 }
 
 /**
@@ -99,15 +132,31 @@ async function enableVideoMode() {
 		20000,
 		200,
 	);
-	if (!trigger) throw new Error("Could not find the mode-select trigger on the page.");
+	// All three failure points below are tagged "PAGE_NOT_READY:" — originally
+	// only the trigger-not-found case was, on the theory that it was the
+	// clearest signal of a React hydration crash (an uncaught "Minified React
+	// error #418" in react-dom-vendor.js, confirmed via a user devtools
+	// screenshot, correlated with third-party ad-tracker requests getting
+	// blocked mid-hydration). Real testing after that fix showed the same
+	// symptom (composer never becomes interactive, item stuck on "Generating")
+	// recurring even with the trigger present and found — i.e. the mode-select
+	// dropdown opening but its item never registering, or the confirmation
+	// pill never appearing, are just as much a "the page silently isn't
+	// actually interactive yet" signal as the trigger missing entirely was.
+	// Nothing was ever submitted at any of these three points, so all of them
+	// are safe for sidepanel.js's runQueue() to reload-and-retry automatically
+	// — unlike a failure after Send is actually clicked, where a retry could
+	// double-submit (see the plain, untagged errors after button.click() in
+	// runPrompt() below, and waitForResult()'s own timeout).
+	if (!trigger)
+		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger on the page.");
 	trigger.click();
 
-	// Same post-reload slowness as the trigger wait above applies here too —
-	// confirmed live: the trigger was found and the menu item below was found
-	// and clicked successfully, but the confirmation pill still took longer
-	// than 3s to actually render under that load, throwing this function's
-	// last error even though every step up to it had genuinely worked.
-	// Widened to match the trigger wait instead of leaving these tighter.
+	// Small human-paced delay before picking the menu item, as if someone
+	// actually looked at the dropdown before clicking, rather than clicking
+	// the instant it opens.
+	await sleep(250 + Math.random() * 400);
+
 	const item = await waitFor(
 		() =>
 			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
@@ -116,11 +165,15 @@ async function enableVideoMode() {
 		20000,
 		200,
 	);
-	if (!item) throw new Error("Could not find the 'Create Video' option in the mode menu.");
+	if (!item)
+		throw new Error(
+			"PAGE_NOT_READY: Could not find the 'Create Video' option in the mode menu.",
+		);
 	item.click();
 
 	const enabled = await waitFor(isVideoModeOn, 20000, 200);
-	if (!enabled) throw new Error("Selected 'Create Video' but video mode did not turn on.");
+	if (!enabled)
+		throw new Error("PAGE_NOT_READY: Selected 'Create Video' but video mode did not turn on.");
 }
 
 /**
@@ -140,6 +193,41 @@ function findDailyLimitMessage() {
 	const text = document.body.innerText || "";
 	if (/daily usage limit/i.test(text)) return text.match(/[^.\n]*daily usage limit[^.\n]*/i)[0];
 	return null;
+}
+
+/**
+ * Detects chat.qwen.ai's own rate-limit response — confirmed live via a
+ * user devtools screenshot: "Oops! There was an issue connecting to
+ * Qwen3.7-Plus. Too many requests in a short period." This is a distinct,
+ * short-lived condition from the daily usage limit above (that one needs
+ * account rotation; this one just needs to wait out the rate window and
+ * retry the same account) — before this existed, RUN_PROMPT had nothing that
+ * recognized this message at all, so a rate-limited submission (which
+ * genuinely never produces a video) left waitForResult() blindly polling for
+ * one until its full 180s timeout, which is exactly what "stuck on
+ * Generating with no error" turned out to be in that reproduction.
+ *
+ * Returns a *count* of matches, not a boolean/text match like
+ * findDailyLimitMessage() — deliberately, because this error bubble stays
+ * visible in the chat transcript after it happens. A plain whole-page text
+ * scan (like findDailyLimitMessage() uses) would keep matching that same old
+ * bubble forever on every later prompt, even once the rate-limit window has
+ * passed and a fresh submission would actually succeed. waitForResult()
+ * below snapshots this count when generation starts and only treats a rise
+ * in the count as a genuinely new occurrence, the same "new, not
+ * pre-existing" principle it already applies to detecting a finished video
+ * via the `alreadyPresent` src Set.
+ */
+function countRateLimitOccurrences() {
+	const text = document.body.innerText || "";
+	const matches = text.match(/too many requests in a short period/gi);
+	return matches ? matches.length : 0;
+}
+
+function findRateLimitMessage() {
+	const text = document.body.innerText || "";
+	const match = text.match(/[^.\n]*too many requests in a short period[^.\n]*/i);
+	return match ? match[0] : "Too many requests in a short period.";
 }
 
 /**
@@ -295,6 +383,10 @@ function waitForResult(timeoutMs = 180000) {
 			(img) => img.src,
 		),
 	);
+	// See countRateLimitOccurrences()'s comment: a rise from this snapshot, not
+	// the mere presence of the phrase, is what distinguishes a fresh rate-limit
+	// hit from an old error bubble still sitting in the chat transcript.
+	const rateLimitCountAtStart = countRateLimitOccurrences();
 
 	return new Promise((resolve, reject) => {
 		const finish = (fn) => {
@@ -304,24 +396,36 @@ function waitForResult(timeoutMs = 180000) {
 		};
 
 		const timeout = setTimeout(() => {
+			qvfLog("waitForResult: timed out after " + timeoutMs + "ms with no video, no daily-limit message, and no new rate-limit message");
 			finish(() => reject(new Error("Timed out waiting for the video to finish generating.")));
 		}, timeoutMs);
 
 		const check = () => {
 			const limitMessage = findDailyLimitMessage();
 			if (limitMessage) {
+				qvfLog("waitForResult: daily-limit message detected");
 				finish(() => resolve({ dailyLimitReached: true, message: limitMessage }));
+				return;
+			}
+			if (countRateLimitOccurrences() > rateLimitCountAtStart) {
+				qvfLog("waitForResult: rate-limit message detected");
+				finish(() =>
+					resolve({ dailyLimitReached: false, rateLimited: true, message: findRateLimitMessage() }),
+				);
 				return;
 			}
 			const cover = Array.from(
 				document.querySelectorAll(".qwen-video-control img.video-cover"),
 			).find((img) => img.src && !alreadyPresent.has(img.src));
 			if (cover) {
-				finish(() => resolve({ dailyLimitReached: false, result: extractResult(cover) }));
+				qvfLog("waitForResult: video result detected");
+				finish(() =>
+					resolve({ dailyLimitReached: false, rateLimited: false, result: extractResult(cover) }),
+				);
 			}
 		};
 
-		check(); // catches a limit message that's already on the page by the time this starts
+		check(); // catches a limit/rate-limit message that's already on the page by the time this starts
 		const observer = new MutationObserver(check);
 		observer.observe(document.body, {
 			childList: true,
@@ -355,6 +459,19 @@ function sleep(ms) {
 }
 
 /**
+ * Timestamped, greppable console output for each major step of runPrompt().
+ * Added specifically because a real test hit a total silent hang — no error,
+ * no status update, nothing — that none of the existing PAGE_NOT_READY /
+ * CONNECTION_LOST tagging caught, so there was no way to tell from the side
+ * panel alone which step it actually got stuck on. Open DevTools on the
+ * chat.qwen.ai tab (F12 → Console) before clicking Start Queue to capture
+ * this next time it happens.
+ */
+function qvfLog(step) {
+	console.log(`[QVF ${new Date().toISOString()}] ${step}`);
+}
+
+/**
  * Run a single prompt end-to-end: fill in the text, submit, wait for
  * result. Checks for the daily-limit message before submitting (in case it's
  * already on the page from a prior prompt) and relies on waitForResult() to
@@ -362,21 +479,38 @@ function sleep(ms) {
  * than treating a limit hit as a generic per-prompt error.
  */
 async function runPrompt(text) {
+	qvfLog("runPrompt: start");
 	const preExisting = findDailyLimitMessage();
 	if (preExisting) {
+		qvfLog("runPrompt: daily limit message already on page, bailing out");
 		return { dailyLimitReached: true, message: preExisting };
 	}
 
 	const input = findPromptInput();
-	if (!input) throw new Error("Could not find the prompt input on the page.");
-	await enableVideoMode();
+	if (!input) throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
 
-	setPromptText(text);
+	// Small settle delay before the first interaction on this page load, as if
+	// someone glanced at the fresh chat before starting to work — also gives a
+	// page that's still finishing hydration a bit more margin before the first
+	// click/dispatch, on top of the composerReady+toolbarReady gate already
+	// checked before the queue's first RUN_PROMPT.
+	await sleep(600 + Math.random() * 900);
+
+	qvfLog("runPrompt: enableVideoMode (1st call) starting");
+	await enableVideoMode();
+	qvfLog("runPrompt: enableVideoMode (1st call) done, videoModeOn=" + isVideoModeOn());
+
+	qvfLog("runPrompt: setPromptText starting");
+	await setPromptText(text);
+	qvfLog(
+		"runPrompt: setPromptText done, live textarea value length=" +
+			(findPromptInput() ? findPromptInput().value.length : "no textarea found"),
+	);
 
 	// Short randomized pause before submitting, as if someone typed the
 	// prompt and glanced over it, rather than submitting the instant the
 	// field is filled (same rationale as Overflow's flow.js).
-	await sleep(400 + Math.random() * 900);
+	await sleep(600 + Math.random() * 1200);
 
 	// Re-check right before submitting rather than trusting enableVideoMode()'s
 	// earlier confirmation: on a brand-new chat (no session yet, composer's
@@ -387,11 +521,15 @@ async function runPrompt(text) {
 	// instead of a video generation with no error raised anywhere. Re-assert
 	// it here, at the last moment before clicking Send.
 	if (!isVideoModeOn()) {
+		qvfLog("runPrompt: video mode dropped before Send, re-enabling (2nd call)");
 		await enableVideoMode();
+		qvfLog("runPrompt: enableVideoMode (2nd call) done, videoModeOn=" + isVideoModeOn());
 	}
 
+	qvfLog("runPrompt: looking for the submit button");
 	const button = findGenerateButton();
-	if (!button) throw new Error("Could not find the submit button.");
+	if (!button) throw new Error("PAGE_NOT_READY: Could not find the submit button.");
+	qvfLog("runPrompt: clicking Send, entering waitForResult()");
 	button.click();
 
 	return waitForResult();
@@ -406,10 +544,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 		// has actually mounted the prompt input, rather than guessing with a
 		// fixed delay after the page's load event. loginFormReady does the same
 		// for switchAccountAndWait()'s wait on the login page appearing.
+		//
+		// toolbarReady checks for the mode-select trigger specifically, not just
+		// the textarea — confirmed live that the textarea alone is too weak a
+		// signal: a React hydration crash on chat.qwen.ai's own page (see the
+		// PAGE_NOT_READY comment in enableVideoMode() above) can leave a
+		// textarea sitting inertly in the DOM while the rest of the composer
+		// toolbar around it never mounts. reloadTabAndWait() in background.js
+		// now waits for both before letting the queue proceed, closing the
+		// window where the very first RUN_PROMPT of a batch fires at a page
+		// that looks ready but isn't actually interactive yet.
 		sendResponse({
 			ok: true,
 			videoModeOn: isVideoModeOn(),
 			composerReady: !!findPromptInput(),
+			toolbarReady: !!document.querySelector('[aria-label="Select Mode"]'),
 			loginFormReady: isLoginFormPresent(),
 			dailyLimitReached: !!findDailyLimitMessage(),
 		});

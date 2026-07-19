@@ -101,8 +101,18 @@ function findActiveQwenTab() {
  * firing chrome.tabs.reload() and guessing. "complete" (the tab's load
  * event) only means the network/resources finished — a heavy SPA can take
  * noticeably longer than that to actually mount its chat composer. Polls the
- * (freshly re-injected) content script's own composerReady signal after
- * "complete" fires, instead of trusting a fixed delay.
+ * (freshly re-injected) content script's own composerReady + toolbarReady
+ * signals after "complete" fires, instead of trusting a fixed delay.
+ *
+ * Requiring toolbarReady too (not just composerReady) closes a real gap,
+ * confirmed against a user devtools screenshot: chat.qwen.ai can hit an
+ * uncaught React hydration crash (error #418, correlated with blocked
+ * third-party ad-tracker requests racing hydration) that leaves the
+ * <textarea> sitting inertly in the DOM — satisfying composerReady — while
+ * the rest of the composer toolbar around it never mounts. Without this, the
+ * queue's first RUN_PROMPT of a batch could fire at a page that looks ready
+ * but isn't actually interactive, silently doing nothing (see
+ * enableVideoMode()'s PAGE_NOT_READY comment in content-scripts/qwen.js).
  */
 function reloadTabAndWait(tabId, timeoutMs = 30000) {
 	return new Promise((resolve, reject) => {
@@ -126,7 +136,7 @@ function reloadTabAndWait(tabId, timeoutMs = 30000) {
 				(response) => {
 					void chrome.runtime.lastError; // content script not injected yet right after reload — expected, ignore
 					if (done) return;
-					if (response && response.ok && response.composerReady) {
+					if (response && response.ok && response.composerReady && response.toolbarReady) {
 						done = true;
 						clearTimeout(timeout);
 						resolve();
@@ -332,11 +342,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 			}
 			chrome.tabs.sendMessage(tab.id, message, (response) => {
 				if (chrome.runtime.lastError) {
+					// This relay is the only path a RUN_PROMPT travels through, and
+					// nothing in this extension's own code navigates or reloads the
+					// tab while a RUN_PROMPT is in flight (reloadTabAndWait() only
+					// ever runs before the first one). So a dead message port here
+					// during a RUN_PROMPT can only mean something external navigated
+					// the tab away mid-request — in practice, the user manually
+					// reloading/navigating chat.qwen.ai while a prompt was still
+					// running. Tagged "CONNECTION_LOST:" so runQueue() in
+					// sidepanel.js can recognize this specific case: it has no way to
+					// know whether the in-flight generation actually completed, so it
+					// must not silently treat this like a normal per-prompt failure
+					// and race ahead to the next item — confirmed live as the actual
+					// cause of the queue appearing to "not wait" for a video that was
+					// still generating.
 					sendResponse({
 						ok: false,
-						error:
+						error: `CONNECTION_LOST: ${
 							chrome.runtime.lastError.message ||
-							"Could not reach the content script — try reloading the chat.qwen.ai tab.",
+							"Could not reach the content script — the tab may have navigated or reloaded."
+						}`,
 					});
 					return;
 				}

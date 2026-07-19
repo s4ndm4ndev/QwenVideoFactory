@@ -15,6 +15,337 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-19 — Planned (not yet implemented): an in-panel Log tab, and blocking use while an ad blocker is active
+
+- **Request**: the user confirmed today's rate-limit fix (previous entry)
+  works. Asked to record two features to plan and implement tomorrow,
+  without building either today.
+- **Feature 1 — a "Log" tab** in the side panel (alongside the existing
+  Controls/About tabs), showing the same kind of step-by-step activity
+  currently only visible via DevTools' console on the chat.qwen.ai tab (the
+  `qvfLog()` calls added in `content-scripts/qwen.js` earlier today). Goal:
+  make troubleshooting/bug reports easier for users who don't have DevTools
+  open — today's whole diagnosis only became possible once the user
+  happened to have the console open at the right moment. Will need a way to
+  get that output from the content script's page-context console up to the
+  side panel UI — likely by extending the existing content-script →
+  `background.js` → panel broadcast pattern (`background.js` already relays
+  `target: "panel"` messages, used today by `QWEN_FOCUS_CHANGED`) rather than
+  inventing a new channel.
+- **Feature 2 — ad-blocker detection**, blocking use until it's disabled. If
+  an ad-blocking extension is detected active, show the same full-panel
+  blocking overlay already used for "not on chat.qwen.ai"
+  (`showBlockingOverlay()` in `sidepanel.js`), telling the user to disable it
+  before continuing — not just a warning, a hard block on using the
+  extension at all. Motivated directly by today's earlier investigation: the
+  uncaught React hydration crash (error #418) from the user's live-testing
+  session was correlated with blocked `pagead2.googlesyndication.com`
+  ad-tracker requests — i.e. an ad blocker interfering with chat.qwen.ai's
+  own script execution in a way that can break the composer. (Today's actual
+  reproduced bug turned out to be a separate rate-limit issue, not this —
+  but the correlation from the earlier live-testing session is real and
+  still worth guarding against.) Will need an actual detection mechanism —
+  likely a bait network request to a known ad-related URL pattern that a
+  blocker intercepts (a standard client-side ad-blocker-detection
+  technique) — checked alongside the existing composerReady/toolbarReady
+  gate.
+- **Not implemented** — both are planning notes for tomorrow's session, no
+  code changed for either yet.
+
+## 2026-07-19 — Found and fixed the actual root cause: chat.qwen.ai's own rate limiter, invisible to every check that existed before today's console-log diagnostics
+
+- **Request**: the user ran the diagnostics from the previous entry (DevTools
+  console open on the chat.qwen.ai tab before Start Queue) and shared a
+  screenshot. This closes out the guessing loop the last three entries were
+  in.
+- **The console output was decisive**: `enableVideoMode` (1st call) completed
+  in under a second with `videoModeOn=true`; `setPromptText` completed
+  cleanly (~11s for a 306-character prompt, matching the new per-character
+  typing pace); the submit button was found and Send was clicked right on
+  schedule. Everything the extension does was working correctly. The visible
+  page content told the rest of the story: a red banner reading "Oops! There
+  was an issue connecting to Qwen3.7-Plus. Too many requests in a short
+  period." — chat.qwen.ai's own rate limiter, a completely different message
+  from the "daily usage limit" text `findDailyLimitMessage()` has ever
+  checked for. Nothing in `runPrompt()` or `waitForResult()` recognized this
+  message at all, so after a rate-limited submission (which, correctly,
+  never produces a video, since the request was rejected before generation
+  ever started), `waitForResult()` just sat there blind for its full 180s
+  timeout, watching for something that could never appear — exactly what
+  "stuck on Generating, no error, no status update" turned out to be. None
+  of the previous three entries' theories (React hydration crash, dead
+  message port, stale DOM references) were the cause of *this*
+  reproduction; the earlier evidence (the #418 console error, the blocked ad
+  requests) may be a real, separate issue, or may itself have been a
+  downstream symptom of the same rapid repeated testing that trips this rate
+  limiter — not resolved either way, but no longer needs to be, since this
+  reproduction is now fully explained end to end.
+- **`content-scripts/qwen.js`**:
+  - Added `findRateLimitMessage()` and `countRateLimitOccurrences()`. The
+    count-based approach (not a simple presence check like
+    `findDailyLimitMessage()`) is deliberate: this error bubble stays visible
+    in the chat transcript afterward, so a plain whole-page text scan would
+    keep matching that same old bubble on every later prompt forever, even
+    once the rate-limit window has actually passed. `waitForResult()`
+    snapshots the count when generation starts and only treats a *rise* in
+    the count as a genuinely new hit — the same "new, not pre-existing"
+    principle already used for detecting a finished video via the
+    `alreadyPresent` src `Set`.
+  - `waitForResult()` now also resolves (quickly, not after the full 180s)
+    when a new rate-limit occurrence appears, with `{ rateLimited: true,
+    message }`. Added `qvfLog()` calls at each of its three resolution paths
+    (daily-limit, rate-limit, video found) and its timeout, so the console
+    log always shows which one actually happened, not just that
+    `waitForResult()` was entered.
+- **`sidepanel/sidepanel.js`**: `runQueue()` now branches on
+  `result.rateLimited` the same way it already does for
+  `dailyLimitReached`, but without account rotation (same account, no reason
+  to switch) — instead it waits out a new `rateLimitCooldown()`: an
+  escalating, visibly-counting-down pause (45s, 75s, 105s, ... capped at 4
+  minutes) before retrying the *same* item in place. Bounded to 5 attempts
+  per item, tracked via a new `queue[i].rateLimitRetries` counter; if still
+  rate-limited after that, the whole queue stops (not just that one item) —
+  since a real rate limit is shared across the account/IP, every remaining
+  item would almost certainly hit the same wall immediately, so continuing
+  to hammer the server item-by-item would likely make it worse, not better.
+- **Confirmed live, unlike every fix in the previous three entries** — this
+  one was diagnosed directly from the user's own real reproduction and
+  console output, not reasoned through blind. The fix logic itself (the new
+  branch in `runQueue()`, the cooldown, the count-based detection) wasn't
+  independently re-run against a live rate-limited response after being
+  written, so the next real-world test is still what confirms it end-to-end
+  — but the diagnosis this time is solid, not a guess.
+
+## 2026-07-19 — Added a hard timeout safety net for RUN_PROMPT and step-by-step console logging, after a screen recording showed a hang that no existing error tag caught
+
+- **Request**: the user recorded a screen video (couldn't be played back in
+  this session — no ffmpeg/VLC/similar installed, and installing one wasn't
+  pursued given the user could just describe it) of a test: click Start → the
+  expected initial reload happens → the extension's actions visibly "flicker"
+  → the page resets to the plain landing UI → the item sits on "Generating"
+  indefinitely. Follow-up questions confirmed two things that rule out both
+  of the two previous entries' fixes as the explanation: the status line
+  never showed the "reloading and retrying" text from the PAGE_NOT_READY
+  auto-retry path, and the flicker/reset happened only once, not repeatedly
+  (a retry loop would show it up to 2 more times).
+- **Reasoned through why every existing tagged path should have caught this,
+  and none did**: every `waitFor()` in `enableVideoMode()` is bounded to 20s,
+  the typing loop in `setPromptText()` is bounded by the prompt's own length,
+  and a dead message port during RUN_PROMPT was already supposed to surface
+  as `CONNECTION_LOST:` via `chrome.runtime.lastError` in background.js's
+  relay. Since none of that fired, the most plausible remaining explanation
+  is that chat.qwen.ai's own crash-recovery does a real
+  `window.location.reload()` (not just a same-page React remount) at a point
+  where Chrome's extension messaging doesn't reliably invoke the pending
+  `sendMessage` callback with `lastError` — a real gap, but not one worth
+  chasing further blind (this repo has hit that dead end before — see the
+  2026-07-19 entry about surfacing per-item error text after two blind
+  guesses didn't converge).
+- **Decided not to keep guessing the exact cause, and instead made two
+  changes that don't depend on identifying it correctly**:
+  - **`sidepanel/sidepanel.js`**: added `withTimeout()`, and wrapped the
+    `RUN_PROMPT` call in `runQueue()` with a 360000ms (6 minute) bound —
+    generous enough to cover the legitimate worst case (settle delay +
+    `enableVideoMode()`'s up-to-two ~60s attempts + typing +
+    `waitForResult()`'s own 180s ≈ 5.4 minutes) without false-triggering on a
+    real, still-in-progress generation. If nothing else ever calls back, this
+    resolves to the same `CONNECTION_LOST:`-tagged shape the existing
+    (working) pause-and-explain path already handles — so regardless of
+    what's actually causing the hang, the queue can no longer sit frozen
+    forever with zero feedback; worst case, it pauses after 6 minutes with a
+    clear explanation instead.
+  - **`content-scripts/qwen.js`**: added `qvfLog()`, a timestamped
+    `console.log` helper, called at every major step of `runPrompt()` (start,
+    daily-limit pre-check, each `enableVideoMode()` attempt, `setPromptText()`
+    start/done with the live textarea's resulting value length, Send click).
+    Also added page-level `beforeunload`/`pagehide`/`error`/
+    `unhandledrejection` listeners — specifically to answer, with certainty
+    next time, the open question above: does a real navigation happen
+    (`beforeunload`/`pagehide` fire) or does the page only visually reset with
+    no navigation at all (a same-page React remount, a different kind of bug
+    with a different fix)? Purely diagnostic, no behavior change. Documented
+    the intent directly in the code: open DevTools on the chat.qwen.ai tab
+    before the next Start Queue click, and the console (filterable by
+    `[QVF`) should show exactly which step it was on, in what order, at what
+    timestamps, when the hang happened.
+- **Not independently reproduced live** — same tooling constraint as the
+  previous two entries. Next real-world test should either resolve
+  cleanly, or — if it hangs again — pause after at most 6 minutes with a
+  clear message instead of sitting frozen indefinitely, and the DevTools
+  console from that run should make the exact failing step and whether a
+  real navigation occurred unambiguous, closing the guessing loop these last
+  three entries have been in.
+
+## 2026-07-19 — Broadened PAGE_NOT_READY tagging past the mode-select trigger; added human-paced typing/delays; made the exhaustion summary self-diagnostic
+
+- **Request**: the user tested the previous entry's fix. With their ad
+  blocker off, the first run worked, but a second run (ad blocker still off)
+  hit the same "nothing gets set, no error, stuck on Generating" symptom
+  again — meaning it isn't only caused by the ad-blocker-correlated hydration
+  crash from the previous entry, since that variable was controlled for this
+  time. They also hit "Limit reached" on the very first (unlisted, currently
+  logged-in) account and couldn't tell from the message whether that was
+  genuine quota exhaustion or a rotation failure. They also still believe
+  manual refresh is problematic, and asked to slow the whole interaction down
+  to look more like a real human user.
+- **Root cause of the recurring silent failure**: the previous entry's
+  `PAGE_NOT_READY` tagging only covered `enableVideoMode()`'s *first* failure
+  point (the mode-select trigger never mounting). But the user's second run
+  showed the prompt text, the video-mode tag, *and* the send action all
+  failing to register — meaning the trigger was likely found and clicked, but
+  a later step (the dropdown item, or the confirmation pill) silently didn't
+  register, which threw a plain, untagged error instead — not
+  auto-retried, and reached only after further ~20s waits, so it kept
+  presenting as a long, silent "Generating" hang before anything visible
+  happened.
+- **`content-scripts/qwen.js`**:
+  - All three of `enableVideoMode()`'s failure points (trigger not found,
+    "Create Video" item not found, confirmation pill not appearing) are now
+    tagged `"PAGE_NOT_READY:"`, not just the first — the underlying signal
+    (nothing was ever submitted, so a reload-and-retry is safe) is the same
+    for all three, and real testing showed the failure isn't confined to the
+    trigger step. Same tag added to the two remaining pre-Send throws in
+    `runPrompt()` (`findPromptInput()` and `findGenerateButton()` both
+    returning nothing) for the same reason. Deliberately did **not** tag
+    anything after `button.click()` (`waitForResult()`'s own timeout) — a
+    submission was actually attempted there, so blindly retrying risks a
+    double-submit; that boundary ("was Send actually clicked?") is what
+    decides safe-to-auto-retry vs. not.
+  - `setPromptText()` now types character-by-character (native-setter call +
+    a fresh `'input'` event per character, ~15–35ms apart) instead of setting
+    the whole string in one call — both to look less like a single
+    all-at-once scripted action, and because per-keystroke events are a more
+    typical input pattern for a framework's controlled-input state to react
+    to than one big value swap.
+  - Added a 600–1500ms settle delay in `runPrompt()` before the first
+    interaction on a page load (on top of the existing
+    composerReady+toolbarReady gate), a 250–650ms pause in `enableVideoMode()`
+    between opening the mode dropdown and clicking an item in it, and widened
+    the existing pre-Send pause from 400–1300ms to 600–1800ms — all aimed at
+    not clicking/typing the instant something becomes possible, per the
+    user's request to slow the whole flow toward human pacing.
+- **`sidepanel/sidepanel.js`**: `buildExhaustionSummary()` (the text that
+  ends up as the persistent per-item error line when every account is used
+  up) now includes the same per-status breakdown `updateAccountStatusUI()`
+  already showed separately (factored out into a shared
+  `accountStatusBreakdown()` helper) — e.g. "(1 exhausted, 1 failed, 1
+  unused)" — directly in the message, so a nonzero "failed" count (a rotation
+  attempt that didn't work) is visible without the user having to separately
+  check the account-status line above the queue. This doesn't change the
+  actual rotation logic — whether the first account's "Limit reached" this
+  time was genuine same-day exhaustion (very plausible after this much
+  testing on the same real account today) or an actual switch failure wasn't
+  independently diagnosed; the breakdown text is what should answer that on
+  the next occurrence.
+- **Not independently reproduced live** — same tooling constraint as the
+  previous entry (no installed-extension context available to this session's
+  browser automation). The typing-simulation and broadened-tagging changes
+  are reasoned through from the exact mechanics involved, not observed
+  firsthand. Next real-world test should confirm: the second-run-only-style
+  failure (mode tag/prompt/send all silently not registering) now surfaces
+  as a fast, auto-retried `PAGE_NOT_READY` instead of a long silent hang: and
+  that the next "Limit reached" stop shows a clear breakdown distinguishing
+  genuine exhaustion from a failed switch attempt.
+
+## 2026-07-19 — Fixed the first-prompt-stuck-on-fresh-session bug and the queue racing ahead after a manual refresh, by treating both as one root cause
+
+- **Request**: the user reported three linked symptoms from real testing: (1)
+  the first prompt of a batch still tends to fail when chat.qwen.ai starts on
+  a brand-new session — Start Queue reloads the tab, nothing gets typed, no
+  error appears, but the item sits at "Generating…" forever, until a few
+  manual page refreshes eventually get it working; (2) once it does start
+  working after those refreshes, the queue stops waiting for the
+  currently-generating video and fires the next prompt while the previous one
+  is still running; (3) manually refreshing chat.qwen.ai while the queue is
+  running seems to cause more problems than it solves. Asked to investigate
+  using Claude-in-Chrome rather than guessing.
+- **Investigated live** (Claude-in-Chrome, unauthenticated — no accounts file
+  was provided, so login/generation itself wasn't re-tested): repeated fresh
+  loads of chat.qwen.ai consistently mounted the composer *and* the
+  mode-select toolbar within about a second, with no hydration errors and no
+  `googlesyndication.com` ad-tracker requests at all in this environment —
+  unlike the user's own devtools screenshot, which showed an uncaught
+  "Minified React error #418" (a React hydration-mismatch crash) in
+  `react-dom-vendor.js`, occurring alongside several blocked
+  `pagead2.googlesyndication.com` requests (`ERR_BLOCKED_BY_CLIENT`, i.e. the
+  user's own ad/tracker blocking) and an "[APLUS] -- APLUS INIT SUCCESS" log
+  line from an Alibaba tracking script. This strongly points to third-party ad
+  scripts racing chat.qwen.ai's own React hydration on the user's machine, not
+  reproducible here without that same blocking setup in front of the same ad
+  scripts — the *crash* itself is not something this extension can fix (it's
+  chat.qwen.ai's own page, interacting with the user's browser
+  configuration), so the fix instead makes the extension resilient to it.
+- **Root cause, tying all three symptoms together**: `composerReady` (checked
+  by `reloadTabAndWait()` in `background.js` before the queue's first
+  `RUN_PROMPT`) only ever confirmed the `<textarea>` element exists — not that
+  the page around it had actually finished mounting/hydrating. A React
+  hydration crash can leave that textarea sitting inertly in the DOM
+  (satisfying `composerReady`) while the rest of the composer toolbar
+  (`enableVideoMode()`'s mode-select trigger) never mounts, so dispatching
+  input events at it does nothing and nothing throws — `enableVideoMode()`'s
+  own 20s+20s+20s waits (widened in an earlier entry) just poll a dead page
+  for up to a minute-plus before finally erroring, reading as "stuck on
+  Generating" the whole time. The user's own reasonable response — manually
+  reloading the tab — is what actually caused symptom 2: it severs the
+  in-flight `RUN_PROMPT`'s message port mid-request, which
+  `background.js`'s content relay already caught, but only ever surfaced as a
+  generic per-prompt error, which `runQueue()` then silently advanced past
+  (`i++`) exactly like any other failed prompt — racing ahead to the next
+  item while the previous one's generation (real or orphaned) was still
+  unresolved, with no way to know which. Symptom 3 (refreshing causes more
+  problems) is just this same mechanism from the user's side: there was no
+  code path that treated "the tab just got yanked out from under an in-flight
+  request" as meaningfully different from "the content script reported a real
+  failure."
+- **`content-scripts/qwen.js`**:
+  - PING's response now also reports `toolbarReady` (whether
+    `[aria-label="Select Mode"]` exists), alongside the existing
+    `composerReady`.
+  - `enableVideoMode()`'s first wait (for the mode-select trigger) now throws
+    with a `"PAGE_NOT_READY: "` prefix specifically when the trigger never
+    appears at all — the strongest available signal that the page hit a
+    hydration crash rather than just being slow, since nothing else in that
+    function distinguishes "toolbar never mounted" from "menu item took a
+    moment to render."
+- **`background.js`**:
+  - `reloadTabAndWait()`'s post-reload poll now requires `toolbarReady` in
+    addition to `composerReady` before letting the queue proceed — closes the
+    gap where the first `RUN_PROMPT` of a batch could fire at a page that
+    merely *looks* ready.
+  - The `target: "content"` relay now tags a dead message port during a
+    `RUN_PROMPT` with a `"CONNECTION_LOST: "` prefix — reasoned through why
+    this specific relay can only ever see that from something external
+    navigating the tab (this extension's own code never touches the tab URL
+    while a `RUN_PROMPT` is in flight), so it's always attributable to a
+    manual refresh/navigation, never a false positive from this extension's
+    own automation.
+  - **`sidepanel/sidepanel.js`**'s `runQueue()`: `CONNECTION_LOST` results now
+    pause the queue (without advancing `i`) and show a message explaining
+    what happened and telling the user to check the tab before resuming,
+    instead of being marked a normal error and silently continued past.
+    `PAGE_NOT_READY` results now trigger an automatic reload-and-retry of the
+    same item (bounded to 2 attempts via a new per-item
+    `pageNotReadyRetries` counter, since nothing was ever actually submitted
+    in this failure mode) instead of surfacing as an error immediately — this
+    replaces the user's own manual-refresh workaround with the extension
+    doing the same recovery safely, at a point where there's no in-flight
+    generation to worry about, rather than requiring it to happen while a
+    `RUN_PROMPT` might already be running (which is exactly what caused
+    symptom 2/3 above).
+- **Not independently reproduced live**: the actual React #418 hydration
+  crash itself (couldn't reproduce chat.qwen.ai's page under the same
+  ad/tracker-blocking conditions as the user's real browser — see above), and
+  the two new retry/pause code paths weren't exercised against a real
+  extension load (this session's Claude-in-Chrome instance doesn't have the
+  unpacked extension installed, and `chrome://extensions` is blocked from
+  automation, same constraint noted in several earlier entries). Reasoned
+  through from the exact mechanics of the message-passing chain instead,
+  which is fully traceable statically. Next real-world test should confirm:
+  a fresh-session batch either starts cleanly, or self-recovers via one or
+  two automatic reload-and-retry cycles without the user needing to touch
+  chat.qwen.ai at all; and that manually refreshing mid-generation now pauses
+  the queue with a clear explanation instead of silently racing ahead.
+
 ## 2026-07-19 — Fixed the in-use account never getting relabeled "exhausted" once rotation genuinely runs out of accounts
 
 - **Request**: the user reported account switching "not working" — after the

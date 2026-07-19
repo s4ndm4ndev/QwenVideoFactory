@@ -212,20 +212,23 @@ function parseAccountsFile(text) {
  * a switch — rather than only showing "current: <email>" and leaving that
  * question to guesswork.
  */
+function accountStatusBreakdown() {
+	const counts = accounts.reduce((acc, a) => {
+		acc[a.status] = (acc[a.status] || 0) + 1;
+		return acc;
+	}, {});
+	return Object.entries(counts)
+		.map(([status, count]) => `${count} ${status}`)
+		.join(", ");
+}
+
 function updateAccountStatusUI() {
 	if (accounts.length === 0) {
 		accountStatusEl.textContent = "No accounts loaded — daily limit will stop the queue.";
 		return;
 	}
 	const active = activeAccount ? activeAccount.email : "none active";
-	const counts = accounts.reduce((acc, a) => {
-		acc[a.status] = (acc[a.status] || 0) + 1;
-		return acc;
-	}, {});
-	const breakdown = Object.entries(counts)
-		.map(([status, count]) => `${count} ${status}`)
-		.join(", ");
-	accountStatusEl.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"} loaded — current: ${active} (${breakdown}).`;
+	accountStatusEl.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"} loaded — current: ${active} (${accountStatusBreakdown()}).`;
 }
 
 accountFileEl.addEventListener("change", () => {
@@ -337,6 +340,37 @@ function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Race a promise against a hard timeout, resolving to `onTimeout` if the
+ * timer wins. Exists specifically to bound RUN_PROMPT below: normally a dead
+ * content-script connection surfaces via chrome.runtime.lastError (tagged
+ * CONNECTION_LOST: in background.js), but real testing showed a case where
+ * neither that nor any of the tagged PAGE_NOT_READY errors ever fired —
+ * status text never updated, the item just sat on "Generating" with no
+ * further feedback at all. The likely cause is chat.qwen.ai itself doing a
+ * real navigation (not just a React remount) as part of its own crash
+ * recovery, landing in a Chrome-messaging edge case where the sendMessage
+ * callback this extension depends on for every other failure signal never
+ * fires. Rather than chase that specific edge case blind, this makes the
+ * queue unable to hang indefinitely regardless of the exact cause.
+ */
+function withTimeout(promise, timeoutMs, onTimeout) {
+	return new Promise((resolve) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			resolve(onTimeout);
+		}, timeoutMs);
+		promise.then((value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+		});
+	});
+}
+
 function sendToContent(type, payload) {
 	return new Promise((resolve) => {
 		chrome.runtime.sendMessage({ target: "content", type, payload }, (response) => {
@@ -430,9 +464,15 @@ async function tryRotateToNextAccount(submittedCount) {
 	return { ok: true };
 }
 
+// Includes the same per-status breakdown as updateAccountStatusUI() directly
+// in the summary text — this is what ends up as the persistent per-item error
+// line (see runQueue()), so it needs to answer "genuinely out of quota" vs
+// "a login/switch attempt itself failed" (a nonzero "failed" count) on its
+// own, without the user having to separately notice the account-status line
+// above the queue.
 function buildExhaustionSummary(submittedCount, total) {
 	return accounts.length
-		? `All ${accounts.length} loaded accounts exhausted or failed to log in — ${submittedCount} of ${total} prompts completed.`
+		? `All loaded accounts exhausted or failed to log in (${accountStatusBreakdown()}) — ${submittedCount} of ${total} prompts completed.`
 		: `Daily limit reached — ${submittedCount} of ${total} submitted. Resume once your quota resets, or load an accounts file to rotate automatically.`;
 }
 
@@ -505,6 +545,34 @@ async function delayWithCountdown() {
 	}
 }
 
+/**
+ * Wait out a rate-limit hit before retrying the same item, ticking a visible
+ * countdown the same way delayWithCountdown() does. Deliberately longer than
+ * the normal inter-prompt delay and escalating per attempt (45s, 75s, 105s,
+ * ..., capped at 4 minutes) — this fires only after chat.qwen.ai has already
+ * said "too many requests," so the normal 8–20s pacing clearly wasn't enough
+ * for whatever's currently happening (heavy same-session testing, a shared
+ * IP, etc.), and retrying too eagerly risks tripping the same limit again
+ * immediately.
+ */
+async function rateLimitCooldown(attempt) {
+	const totalSec = Math.min(45 + (attempt - 1) * 30 + Math.floor(Math.random() * 20), 240);
+
+	for (let remaining = totalSec; remaining > 0; remaining--) {
+		if (!running) break;
+		while (paused || focusPaused) {
+			await sleep(300);
+			if (!running) break;
+		}
+		if (!running) break;
+		setStatus(
+			`Rate limited by chat.qwen.ai — cooling down, retrying in ${remaining}s (attempt ${attempt})...`,
+			"error",
+		);
+		await sleep(1000);
+	}
+}
+
 async function runQueue() {
 	running = true;
 	paused = false;
@@ -559,7 +627,20 @@ async function runQueue() {
 		renderQueue();
 		setStatus(`Running ${submittedCount + 1} of ${queue.length}...`, "running");
 
-		const result = await sendToContent("RUN_PROMPT", { text: queue[i].text });
+		// Bounded well above the legitimate worst case (settle delay +
+		// enableVideoMode's up-to-two attempts at ~60s each + typing +
+		// waitForResult()'s own 180s) so a real, still-in-progress generation
+		// is never mistaken for a hang — see withTimeout()'s comment for why
+		// this exists at all.
+		const result = await withTimeout(
+			sendToContent("RUN_PROMPT", { text: queue[i].text }),
+			360000,
+			{
+				ok: false,
+				error:
+					"CONNECTION_LOST: No response from chat.qwen.ai after 6 minutes — the page likely became unresponsive or silently reloaded.",
+			},
+		);
 
 		// A single RUN_PROMPT can take up to waitForResult()'s 180s timeout to
 		// resolve, and Stop only flips `running` — it doesn't (can't) cancel the
@@ -570,6 +651,58 @@ async function runQueue() {
 		// undefined. Bail out before touching it either way, rather than
 		// crashing on `queue[i].status = ...`.
 		if (!running) break;
+
+		// See background.js's content-relay comment: a dead message port during
+		// a RUN_PROMPT can only be caused by something external navigating the
+		// tab away mid-request (in practice, the user manually reloading
+		// chat.qwen.ai while a prompt was still generating) — never by this
+		// extension's own code. There's no way to know from here whether that
+		// in-flight generation actually finished, so this must not be treated
+		// like a normal per-prompt failure and silently advanced past — doing
+		// so was the actual cause of the queue appearing to not wait for a
+		// video that was still generating. Pause instead, without advancing i,
+		// so the user can check the tab and Resume to retry the same item.
+		if (!result.ok && /^CONNECTION_LOST:/.test(result.error || "")) {
+			queue[i].status = "pending";
+			queue[i].error = null;
+			renderQueue();
+			paused = true;
+			pauseBtn.textContent = "Resume";
+			setStatus(
+				"Lost connection to chat.qwen.ai mid-prompt — the tab was likely reloaded or navigated away while this item was still generating. Queue paused so it doesn't race ahead. Check the tab, then press Resume to retry this item.",
+				"error",
+			);
+			continue; // don't advance i
+		}
+
+		// See enableVideoMode()'s PAGE_NOT_READY comment in
+		// content-scripts/qwen.js — the mode-select trigger never mounting at
+		// all is the strongest available signal that the page hit a React
+		// hydration crash and is genuinely stuck, not just slow. Nothing was
+		// ever submitted in this failure mode (it fails before Send is
+		// clicked), so a fresh reload-and-retry is safe, unlike the
+		// CONNECTION_LOST case above. Bounded so a page that's persistently
+		// broken still surfaces as a real error instead of retrying forever.
+		if (!result.ok && /^PAGE_NOT_READY:/.test(result.error || "")) {
+			const attempts = (queue[i].pageNotReadyRetries || 0) + 1;
+			queue[i].pageNotReadyRetries = attempts;
+			if (attempts <= 2) {
+				setStatus(
+					`chat.qwen.ai didn't finish loading — reloading and retrying (attempt ${attempts})...`,
+					"running",
+				);
+				const refresh = await refreshQwenTab();
+				if (!running) break;
+				if (refresh.ok) {
+					queue[i].status = "pending";
+					renderQueue();
+					continue; // don't advance i
+				}
+				// Refresh itself failed (e.g. no chat.qwen.ai tab at all anymore) —
+				// fall through to the normal error path below rather than retrying
+				// against a tab that isn't there.
+			}
+		}
 
 		if (result.ok && result.dailyLimitReached) {
 			const switched = await tryRotateToNextAccount(submittedCount);
@@ -585,12 +718,45 @@ async function runQueue() {
 			break;
 		}
 
+		// Confirmed live: chat.qwen.ai's own rate limiter ("Too many requests in
+		// a short period") is a distinct, short-lived condition from the daily
+		// usage limit above — the prompt was never actually accepted, so nothing
+		// downstream would ever appear, and without this check runPrompt() used
+		// to just sit blind for the full 180s waitForResult() timeout watching
+		// for a video that was never coming. Same account, no rotation needed —
+		// just wait out the rate window and retry the same item. Escalating
+		// cooldown, bounded retries: if a real account/IP is genuinely being
+		// rate-limited, every other item would hit the same wall immediately
+		// after this one, so this stops the whole queue rather than continuing
+		// to hammer the server item by item.
+		if (result.ok && result.rateLimited) {
+			const attempts = (queue[i].rateLimitRetries || 0) + 1;
+			queue[i].rateLimitRetries = attempts;
+			if (attempts <= 5) {
+				queue[i].status = "pending";
+				queue[i].error = null;
+				renderQueue();
+				await rateLimitCooldown(attempts);
+				if (!running) break;
+				continue; // don't advance i
+			}
+			queue[i].status = "error";
+			queue[i].error = `Still rate-limited by chat.qwen.ai after ${attempts - 1} retries — stopping rather than keep hammering it: ${result.message}`;
+			renderQueue();
+			setStatus(queue[i].error, "error");
+			break;
+		}
+
+		// Only reached for PAGE_NOT_READY here if its retry budget above was
+		// exhausted (or the retry reload itself failed) — strip the internal
+		// tag prefix, it's not meaningful to the user at this point.
+		const displayError = result.ok ? null : (result.error || "").replace(/^PAGE_NOT_READY:\s*/, "");
 		queue[i].status = result.ok ? "done" : "error";
-		queue[i].error = result.ok ? null : result.error;
+		queue[i].error = displayError;
 		renderQueue();
 
 		if (!result.ok) {
-			setStatus(`Prompt ${i + 1} failed: ${result.error}`, "error");
+			setStatus(`Prompt ${i + 1} failed: ${displayError}`, "error");
 		} else {
 			submittedCount++;
 			if (autoDownloadEl.checked) await downloadResult(result.result, i);
