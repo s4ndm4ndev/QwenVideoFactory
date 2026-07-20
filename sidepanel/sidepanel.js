@@ -15,6 +15,11 @@ const autoDownloadEl = document.getElementById("auto-download");
 const downloadSettingsHintEl = document.getElementById("download-settings-hint");
 const openDownloadSettingsBtn = document.getElementById("open-download-settings");
 const downloadFolderEl = document.getElementById("download-folder");
+const referenceImagesToggleEl = document.getElementById("reference-images-toggle");
+const referenceImagesPanelEl = document.getElementById("reference-images-panel");
+const referenceImagesDropzoneEl = document.getElementById("reference-images-dropzone");
+const referenceImagesFileInputEl = document.getElementById("reference-images-file-input");
+const referenceImagesListEl = document.getElementById("reference-images-list");
 const startBtn = document.getElementById("start");
 const pauseBtn = document.getElementById("pause");
 const stopBtn = document.getElementById("stop");
@@ -27,6 +32,11 @@ const blockingOverlayEl = document.getElementById("blocking-overlay");
 const blockingTitleEl = document.getElementById("blocking-title");
 const blockingMessageEl = document.getElementById("blocking-message");
 const blockingActionEl = document.getElementById("blocking-action");
+const confirmOverlayEl = document.getElementById("confirm-overlay");
+const confirmTitleEl = document.getElementById("confirm-title");
+const confirmMessageEl = document.getElementById("confirm-message");
+const confirmYesBtn = document.getElementById("confirm-yes");
+const confirmNoBtn = document.getElementById("confirm-no");
 const tabButtons = document.querySelectorAll(".tab-button");
 const controlsViewEl = document.getElementById("controls-view");
 const aboutViewEl = document.getElementById("about-view");
@@ -68,6 +78,20 @@ let focusPaused = false;
 let logEntries = []; // [{ step, ts }]
 const MAX_LOG_ENTRIES = 500;
 
+// Reference images, paired to prompt lines purely by array position (image
+// at index i pairs with the queue item built from prompt line i). In-memory
+// only, same convention as queue/accounts above — cleared on panel close and
+// after a successful batch (see resetToStartingState()), never written to
+// chrome.storage.local. Only the *enabled* toggle itself is a persisted
+// preference (see SETTINGS_KEY below), not this list.
+let referenceImages = []; // [{ dataUrl, fileName, mimeType }]
+
+// Guards checkLoginState() from firing more than once per relevant trigger
+// point (panel load, each accounts-file load) — it's a one-shot check, not
+// tied to checkBlockingState()'s 3s poll, so nothing else needs to reset
+// this once a login prompt has been shown or skipped for a given trigger.
+let loginCheckInFlight = false;
+
 const SETTINGS_KEY = "qwen_video_factory_settings";
 const DOWNLOAD_NOTICE_KEY = "qwen_video_factory_download_notice_dismissed";
 
@@ -106,6 +130,10 @@ loadSettings().then((settings) => {
 		downloadFolderEl.disabled = !settings.autoDownload;
 	}
 	if (settings.downloadFolder != null) downloadFolderEl.value = settings.downloadFolder;
+	if (settings.referenceImagesEnabled != null) {
+		referenceImagesToggleEl.checked = settings.referenceImagesEnabled;
+		referenceImagesPanelEl.hidden = !settings.referenceImagesEnabled;
+	}
 });
 
 delayMinEl.addEventListener("change", () => saveSettings({ delayMin: delayMinEl.value }));
@@ -260,6 +288,7 @@ accountFileEl.addEventListener("change", () => {
 		activeAccount = null;
 		switchAttempts = 0;
 		updateAccountStatusUI();
+		checkLoginState();
 	};
 	reader.readAsText(file);
 	accountFileEl.value = ""; // allow re-selecting the same file later
@@ -330,6 +359,106 @@ autoDownloadEl.addEventListener("change", () => {
 
 openDownloadSettingsBtn.addEventListener("click", () => {
 	chrome.tabs.create({ url: "chrome://settings/downloads" });
+});
+
+referenceImagesToggleEl.addEventListener("change", () => {
+	referenceImagesPanelEl.hidden = !referenceImagesToggleEl.checked;
+	saveSettings({ referenceImagesEnabled: referenceImagesToggleEl.checked });
+});
+
+function blobToDataUrl(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(reader.result);
+		reader.onerror = () => reject(reader.error || new Error("Failed to read an image."));
+		reader.readAsDataURL(file);
+	});
+}
+
+/**
+ * Append newly uploaded images to referenceImages in upload order — numbering
+ * is purely positional (index in this array), not derived from the
+ * filenames, so a batch of any filenames pairs with prompt lines 1, 2, 3...
+ * in the order they were added.
+ */
+async function addReferenceImageFiles(fileList) {
+	const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+	for (const file of files) {
+		referenceImages.push({
+			dataUrl: await blobToDataUrl(file),
+			fileName: file.name,
+			mimeType: file.type,
+		});
+	}
+	if (files.length > 0) renderReferenceImagesList();
+}
+
+/**
+ * Removing an image shifts every later image's number down by one — correct
+ * here since pairing is purely positional (array index), unlike Overflow's
+ * name-matched character library where removal doesn't renumber anything.
+ */
+function removeReferenceImage(index) {
+	referenceImages.splice(index, 1);
+	renderReferenceImagesList();
+}
+
+function renderReferenceImagesList() {
+	referenceImagesListEl.innerHTML = "";
+	referenceImages.forEach((image, index) => {
+		const li = document.createElement("li");
+
+		const thumb = document.createElement("img");
+		thumb.className = "image-thumb";
+		thumb.src = image.dataUrl;
+		thumb.alt = image.fileName;
+
+		// Same zero-padded convention as downloadResult()'s baseIndex, so image
+		// "001" lines up with the same indexing as this batch's own result
+		// filenames (queue index 0 -> "001").
+		const badge = document.createElement("span");
+		badge.className = "image-number-badge";
+		badge.textContent = String(index + 1).padStart(3, "0");
+
+		const name = document.createElement("span");
+		name.className = "image-file-name";
+		name.textContent = image.fileName;
+
+		const removeBtn = document.createElement("button");
+		removeBtn.type = "button";
+		removeBtn.className = "image-remove";
+		removeBtn.textContent = "×";
+		removeBtn.title = `Remove ${image.fileName}`;
+		removeBtn.addEventListener("click", () => removeReferenceImage(index));
+
+		li.appendChild(thumb);
+		li.appendChild(badge);
+		li.appendChild(name);
+		li.appendChild(removeBtn);
+		referenceImagesListEl.appendChild(li);
+	});
+}
+
+referenceImagesDropzoneEl.addEventListener("click", () => referenceImagesFileInputEl.click());
+
+referenceImagesDropzoneEl.addEventListener("dragover", (e) => {
+	e.preventDefault();
+	referenceImagesDropzoneEl.classList.add("dragover");
+});
+
+referenceImagesDropzoneEl.addEventListener("dragleave", () => {
+	referenceImagesDropzoneEl.classList.remove("dragover");
+});
+
+referenceImagesDropzoneEl.addEventListener("drop", (e) => {
+	e.preventDefault();
+	referenceImagesDropzoneEl.classList.remove("dragover");
+	addReferenceImageFiles(e.dataTransfer.files);
+});
+
+referenceImagesFileInputEl.addEventListener("change", () => {
+	addReferenceImageFiles(referenceImagesFileInputEl.files);
+	referenceImagesFileInputEl.value = ""; // allow re-selecting the same file later
 });
 
 const tabViews = { controls: controlsViewEl, about: aboutViewEl, log: logViewEl };
@@ -435,6 +564,33 @@ function switchAccount(account) {
 }
 
 /**
+ * Log into a chat.qwen.ai tab that isn't logged in at all yet — distinct from
+ * switchAccount() above, which assumes an already-logged-in session to log
+ * out of first (see background.js's LOGIN_ACCOUNT vs SWITCH_ACCOUNT
+ * handlers).
+ */
+function loginAccount(account) {
+	return new Promise((resolve) => {
+		chrome.runtime.sendMessage(
+			{
+				target: "background",
+				type: "LOGIN_ACCOUNT",
+				payload: { email: account.email, password: account.password },
+			},
+			(response) => {
+				const lastError = chrome.runtime.lastError;
+				resolve(
+					response || {
+						ok: false,
+						error: (lastError && lastError.message) || "No response from background script.",
+					},
+				);
+			},
+		);
+	});
+}
+
+/**
  * Log the exhausted account out of rotation and log the next unused one in,
  * via background.js's SWITCH_ACCOUNT orchestration. Bounded by
  * switchAttempts so a run of bad credentials can't loop forever — each
@@ -508,6 +664,31 @@ function hideBlockingOverlay() {
 	blockingOverlayEl.hidden = true;
 }
 
+/**
+ * Small yes/no modal, visually consistent with #blocking-overlay (reuses
+ * .blocking-card) but a distinct element — #blocking-overlay's documented
+ * semantics are "automation cannot proceed at all," which doesn't fit a
+ * dismissible question like "log in now?", and only ever has one action
+ * button. onYes/onNo are wired directly to the buttons rather than
+ * auto-hiding on click, so onYes can show a busy state (e.g. "Logging
+ * in...") before the caller itself calls hideConfirmModal().
+ */
+function showConfirmModal({ title, message, yesLabel, noLabel, onYes, onNo }) {
+	confirmTitleEl.textContent = title;
+	confirmMessageEl.textContent = message;
+	confirmYesBtn.textContent = yesLabel || "Yes";
+	confirmNoBtn.textContent = noLabel || "No";
+	confirmYesBtn.disabled = false;
+	confirmNoBtn.disabled = false;
+	confirmYesBtn.onclick = onYes;
+	confirmNoBtn.onclick = onNo;
+	confirmOverlayEl.hidden = false;
+}
+
+function hideConfirmModal() {
+	confirmOverlayEl.hidden = true;
+}
+
 function showAdBlockerOverlay() {
 	showBlockingOverlay(
 		"An ad blocker was detected. Disable it for this site, then re-check.",
@@ -564,6 +745,70 @@ async function checkBlockingState({ forceAdBlockerRefresh = false } = {}) {
 	hideBlockingOverlay();
 }
 
+/**
+ * Runs when the user clicks "Yes, log in" on the login-on-load confirm
+ * modal. Logs accounts[0] in from scratch (see loginAccount() vs
+ * switchAccount()'s comment), and — if the prompts textarea already has
+ * content — rolls straight into the queue, same as clicking Start.
+ */
+async function onLoginConfirmed() {
+	confirmYesBtn.disabled = true;
+	confirmNoBtn.disabled = true;
+	confirmMessageEl.textContent = "Logging in...";
+
+	const result = await loginAccount(accounts[0]);
+	if (!result.ok) {
+		hideConfirmModal();
+		setStatus(`Login failed: ${result.error}`, "error");
+		return;
+	}
+
+	accounts[0].status = "active";
+	activeAccount = accounts[0];
+	updateAccountStatusUI();
+	hideConfirmModal();
+
+	const built = buildQueueFromPrompts();
+	if (built) {
+		queue = built;
+		renderQueue();
+		runQueue();
+	} else {
+		setStatus("Logged in — add prompts and start the queue when ready.", "idle");
+	}
+}
+
+/**
+ * One-shot login-on-load check — deliberately NOT tied to checkBlockingState()'s
+ * 3s poll, since it should only ask once per relevant trigger point (panel
+ * load, and each time an accounts file is (re)loaded — see the two call sites
+ * below), not repeatedly while the panel sits idle. No-ops if there's nothing
+ * to offer logging in with yet (accounts are in-memory only and reset to
+ * empty on every panel reload, per the comment above their declaration), or
+ * while a queue is already running, or if the tab isn't reachable / has an ad
+ * blocker (checkBlockingState()'s own polling already owns surfacing those).
+ */
+async function checkLoginState() {
+	if (accounts.length === 0 || running || loginCheckInFlight) return;
+	loginCheckInFlight = true;
+	try {
+		const ping = await sendToContent("PING");
+		if (!ping.ok || ping.adBlockerActive) return;
+		if (ping.loggedIn) return;
+
+		showConfirmModal({
+			title: "Not logged in",
+			message: `You're not logged into chat.qwen.ai. Log in with ${accounts[0].email} now?`,
+			yesLabel: "Yes, log in",
+			noLabel: "No, continue",
+			onYes: onLoginConfirmed,
+			onNo: hideConfirmModal,
+		});
+	} finally {
+		loginCheckInFlight = false;
+	}
+}
+
 // Best-effort refresh once when the panel first opens, so automation always
 // starts from a clean page load rather than a tab that's been sitting open
 // accumulating state. Silent on failure — checkBlockingState()'s own
@@ -572,6 +817,7 @@ refreshQwenTab();
 
 checkBlockingState();
 setInterval(checkBlockingState, 3000);
+checkLoginState();
 
 /**
  * Wait the configured (randomized) delay before the next prompt, ticking the
@@ -685,7 +931,7 @@ async function runQueue() {
 		// is never mistaken for a hang — see withTimeout()'s comment for why
 		// this exists at all.
 		const result = await withTimeout(
-			sendToContent("RUN_PROMPT", { text: queue[i].text }),
+			sendToContent("RUN_PROMPT", { text: queue[i].text, image: queue[i].referenceImage || null }),
 			360000,
 			{
 				ok: false,
@@ -858,12 +1104,18 @@ function resetControls() {
 // Clears the prompts textarea and queue/index back to a fresh-panel state
 // after a fully successful batch. Deliberately leaves Auto Download (toggle,
 // folder) and the delay fields alone — those are per-user preferences that
-// should carry over batch to batch, not per-batch inputs.
+// should carry over batch to batch, not per-batch inputs. Reference images
+// clear the same way prompts do — they're per-batch data, positionally paired
+// to prompt lines that no longer exist after this — but the Reference Images
+// toggle itself is left on, same treatment as Auto Download, since it's a
+// preference rather than per-batch data.
 function resetToStartingState() {
 	promptsEl.value = "";
 	queue = [];
 	currentIndex = -1;
 	renderQueue();
+	referenceImages = [];
+	renderReferenceImagesList();
 }
 
 /**
@@ -928,6 +1180,33 @@ copyLogBtn.addEventListener("click", () => {
 	navigator.clipboard.writeText(text).catch(() => {});
 });
 
+/**
+ * Split the prompts textarea into a fresh queue, one item per non-blank
+ * line. Pairs in a reference image per item (by array position) when the
+ * toggle is on — reused both by startBtn's click handler below and by
+ * onLoginConfirmed()'s auto-start path after a successful login-on-load.
+ * Returns null if there are no prompts to run.
+ */
+function buildQueueFromPrompts() {
+	const lines = promptsEl.value
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean);
+
+	if (lines.length === 0) return null;
+
+	return lines.map((line, i) => {
+		const item = { text: line, status: "pending" };
+		if (referenceImagesToggleEl.checked) {
+			const img = referenceImages[i];
+			item.referenceImage = img
+				? { dataUrl: img.dataUrl, fileName: img.fileName, mimeType: img.mimeType }
+				: null;
+		}
+		return item;
+	});
+}
+
 startBtn.addEventListener("click", () => {
 	// If the current queue still has unfinished items (stopped partway
 	// through, hit the daily limit, or a prompt errored out), resume it in
@@ -941,17 +1220,12 @@ startBtn.addEventListener("click", () => {
 			if (item.status !== "done") item.status = "pending";
 		});
 	} else {
-		const lines = promptsEl.value
-			.split("\n")
-			.map((l) => l.trim())
-			.filter(Boolean);
-
-		if (lines.length === 0) {
+		const built = buildQueueFromPrompts();
+		if (!built) {
 			setStatus("Add at least one prompt first.", "error");
 			return;
 		}
-
-		queue = lines.map((line) => ({ text: line, status: "pending" }));
+		queue = built;
 	}
 
 	renderQueue();

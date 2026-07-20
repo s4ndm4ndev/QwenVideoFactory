@@ -195,18 +195,78 @@ function pollUntil(tabId, check, timeoutMs, timeoutMessage) {
 }
 
 /**
- * Orchestrate a full account switch: log the current account out, navigate
- * to the login page, log the next account in, and wait for the composer to
- * reappear.
+ * Navigate to the login page, log the given credentials in, and wait for the
+ * composer to reappear. Shared tail of switchAccountAndWait() (account
+ * rotation, which logs the current account out first) and
+ * loginAccountAndWait() (logging in from scratch — nothing to log out of).
+ *
+ * Confirmed live (via switchAccountAndWait()'s original testing): the login
+ * form lives at a distinct URL, https://chat.qwen.ai/auth, so this navigates
+ * there directly (via chrome.tabs.update) rather than having the content
+ * script hunt for a "Log in" button to click. That navigation does unload
+ * and re-inject the content script the same way a reload does, which is why
+ * this waits for tabs.onUpdated "complete" before polling, mirroring
+ * reloadTabAndWait()'s pattern.
+ */
+function performLoginAndWaitForComposer(tabId, { email, password }, timeoutMs = 45000) {
+	return new Promise((resolve, reject) => {
+		function onAuthPageLoaded(updatedTabId, changeInfo) {
+			if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
+			chrome.tabs.onUpdated.removeListener(onAuthPageLoaded);
+			proceedAfterNavigation();
+		}
+		chrome.tabs.onUpdated.addListener(onAuthPageLoaded);
+		chrome.tabs.update(tabId, { url: "https://chat.qwen.ai/auth" });
+
+		function proceedAfterNavigation() {
+			pollUntil(
+				tabId,
+				(r) => r.loginFormReady,
+				timeoutMs,
+				"Timed out waiting for the login form to appear.",
+			)
+			.then(
+				() =>
+					new Promise((res, rej) => {
+						chrome.tabs.sendMessage(
+							tabId,
+							{ target: "content", type: "PERFORM_LOGIN", payload: { email, password } },
+							(loginResponse) => {
+								if (chrome.runtime.lastError || !loginResponse || !loginResponse.ok) {
+									rej(
+										new Error(
+											(loginResponse && loginResponse.error) ||
+												(chrome.runtime.lastError && chrome.runtime.lastError.message) ||
+												"Login failed.",
+										),
+									);
+									return;
+								}
+								res();
+							},
+						);
+					}),
+			)
+			.then(() =>
+				pollUntil(
+					tabId,
+					(r) => r.composerReady,
+					timeoutMs,
+					"Timed out waiting for chat.qwen.ai to become ready after logging in.",
+				),
+			)
+			.then(resolve)
+			.catch(reject);
+		}
+	});
+}
+
+/**
+ * Orchestrate a full account switch: log the current account out, then
+ * navigate/login/wait via performLoginAndWaitForComposer() above.
  *
  * Confirmed live: clicking "Log out" does NOT navigate anywhere by itself —
- * the page just re-renders the same URL in a logged-out state. The actual
- * login form lives at a distinct URL, https://chat.qwen.ai/auth, so this
- * navigates there directly (via chrome.tabs.update) rather than having the
- * content script hunt for a "Log in" button to click. That navigation does
- * unload and re-inject the content script the same way a reload does, which
- * is why this waits for tabs.onUpdated "complete" before polling, mirroring
- * reloadTabAndWait()'s pattern.
+ * the page just re-renders the same URL in a logged-out state.
  */
 function switchAccountAndWait(tabId, { email, password }, timeoutMs = 45000) {
 	return new Promise((resolve, reject) => {
@@ -221,57 +281,20 @@ function switchAccountAndWait(tabId, { email, password }, timeoutMs = 45000) {
 				);
 				return;
 			}
-
-			function onAuthPageLoaded(updatedTabId, changeInfo) {
-				if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
-				chrome.tabs.onUpdated.removeListener(onAuthPageLoaded);
-				proceedAfterNavigation();
-			}
-			chrome.tabs.onUpdated.addListener(onAuthPageLoaded);
-			chrome.tabs.update(tabId, { url: "https://chat.qwen.ai/auth" });
-
-			function proceedAfterNavigation() {
-				pollUntil(
-					tabId,
-					(r) => r.loginFormReady,
-					timeoutMs,
-					"Timed out waiting for the login form to appear after logging out.",
-				)
-				.then(
-					() =>
-						new Promise((res, rej) => {
-							chrome.tabs.sendMessage(
-								tabId,
-								{ target: "content", type: "PERFORM_LOGIN", payload: { email, password } },
-								(loginResponse) => {
-									if (chrome.runtime.lastError || !loginResponse || !loginResponse.ok) {
-										rej(
-											new Error(
-												(loginResponse && loginResponse.error) ||
-													(chrome.runtime.lastError && chrome.runtime.lastError.message) ||
-													"Login failed.",
-											),
-										);
-										return;
-									}
-									res();
-								},
-							);
-						}),
-				)
-				.then(() =>
-					pollUntil(
-						tabId,
-						(r) => r.composerReady,
-						timeoutMs,
-						"Timed out waiting for chat.qwen.ai to become ready after logging in.",
-					),
-				)
-				.then(resolve)
-				.catch(reject);
-			}
+			performLoginAndWaitForComposer(tabId, { email, password }, timeoutMs).then(resolve, reject);
 		});
 	});
+}
+
+/**
+ * Log into a chat.qwen.ai tab that isn't logged in at all yet — used by the
+ * login-on-load prompt in sidepanel.js, distinct from switchAccountAndWait()
+ * above, which assumes an already-logged-in session to log out of first.
+ * Nothing to log out of here, so this just runs the shared navigate/login/
+ * wait tail directly.
+ */
+function loginAccountAndWait(tabId, { email, password }, timeoutMs = 45000) {
+	return performLoginAndWaitForComposer(tabId, { email, password }, timeoutMs);
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -323,6 +346,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 				return;
 			}
 			switchAccountAndWait(tab.id, message.payload)
+				.then(() => sendResponse({ ok: true }))
+				.catch((err) => sendResponse({ ok: false, error: err.message }));
+		});
+		return true; // async response
+	}
+
+	if (message.target === "background" && message.type === "LOGIN_ACCOUNT") {
+		findActiveQwenTab().then(({ tab, error }) => {
+			if (!tab) {
+				sendResponse({ ok: false, error });
+				return;
+			}
+			loginAccountAndWait(tab.id, message.payload)
 				.then(() => sendResponse({ ok: true }))
 				.catch((err) => sendResponse({ ok: false, error: err.message }));
 		});

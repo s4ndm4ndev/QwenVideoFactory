@@ -102,6 +102,43 @@
 						</button>
 					</div>
 
+					<div class="row">
+						<label for="reference-images-toggle"
+							>Reference images
+							<span class="hint"
+								>attach an image to each prompt, in order</span
+							></label
+						>
+						<label class="switch">
+							<input
+								type="checkbox"
+								id="reference-images-toggle"
+								class="toggle-checkbox" />
+							<span class="switch-track"></span>
+						</label>
+					</div>
+
+					<div id="reference-images-panel" class="image-panel" hidden>
+						<div id="reference-images-dropzone" class="image-dropzone">
+							<span
+								>Click to upload or drag &amp; drop reference
+								images</span
+							>
+							<span class="hint"
+								>Paired with prompts in upload order &mdash;
+								image 1 &rarr; prompt line 1, image 2 &rarr;
+								line 2, etc.</span
+							>
+						</div>
+						<input
+							type="file"
+							id="reference-images-file-input"
+							accept="image/*"
+							multiple
+							hidden />
+						<ul id="reference-images-list" class="image-list"></ul>
+					</div>
+
 					<div class="folder-field">
 						<label for="download-folder"
 							>Download folder
@@ -226,6 +263,17 @@
 				<button id="blocking-action" class="primary">
 					Navigate to chat.qwen.ai
 				</button>
+			</div>
+		</div>
+
+		<div id="confirm-overlay" class="blocking-overlay confirm-overlay" hidden>
+			<div class="blocking-card">
+				<h2 id="confirm-title">Title</h2>
+				<p id="confirm-message">Message</p>
+				<div class="confirm-actions">
+					<button id="confirm-yes" class="primary">Yes</button>
+					<button id="confirm-no" class="secondary">No</button>
+				</div>
 			</div>
 		</div>
 

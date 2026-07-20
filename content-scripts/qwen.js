@@ -343,6 +343,25 @@ function isLoginFormPresent() {
 }
 
 /**
+ * Whether the user is currently logged in while sitting on the main
+ * chat.qwen.ai page — a distinct question from isLoginFormPresent() above,
+ * which only detects the dedicated /auth page. Logging out does NOT navigate
+ * there; per performLogout()'s comment, it re-renders the same URL with the
+ * composer replaced by a placeholder and "Log in"/"Sign up" buttons shown
+ * top-right INSTEAD OF the account-menu button.
+ *
+ * NOT YET CONFIRMED LIVE (unlike the selectors elsewhere in this file):
+ * hypothesizes that button.user-menu-btn (used by findLogoutControl()'s
+ * caller to open the account menu) is only rendered when logged in. Needs
+ * verifying against the real site — in both the logged-in and never-logged-in
+ * states — before this can be trusted the way the rest of this file's
+ * "Confirmed live" selectors are.
+ */
+function isLoggedIn() {
+	return !!document.querySelector("button.user-menu-btn");
+}
+
+/**
  * Fill in and submit the login form with the given credentials. Confirmed
  * live end-to-end, including a real submission: the native-setter +
  * 'input'-event approach below (mirroring setPromptText() above) is enough
@@ -507,6 +526,61 @@ function sleep(ms) {
 }
 
 /**
+ * Attach a reference image to the composer before submitting a prompt.
+ *
+ * BEST-GUESS SKELETON — NOT CONFIRMED LIVE. Unlike every other selector in
+ * this file (each backed by an existing "Confirmed live: ..." comment from
+ * real testing), whether chat.qwen.ai's "Create Video" composer even has a
+ * reference/starting-image upload control at all is unverified. This mirrors
+ * the shape of Overflow's attachCharacterImage() (this extension's sister
+ * project, content-scripts/flow.js) — rebuild a File from the data URL,
+ * drive a file input via a synthetic DataTransfer + change event, then wait
+ * for some on-page confirmation the image was accepted — but every selector
+ * below is a guess to be corrected once tested against the live site:
+ *   - the file input's location/selector (guessed: somewhere near the
+ *     [aria-label="Select Mode"] toolbar, possibly hidden behind an icon
+ *     button that must be clicked first to reveal it)
+ *   - the "image attached" confirmation signal waitFor() polls for (guessed:
+ *     a thumbnail/chip rendered near the composer)
+ *   - whether a synthetic DataTransfer + change/input event is even enough,
+ *     or whether (like Overflow's Flow target) chat.qwen.ai requires a
+ *     trusted click via chrome.debugger instead — if live testing shows
+ *     synthetic events don't register, that's a real scope add (this
+ *     extension currently has no "debugger" permission or DEBUGGER_* handlers,
+ *     unlike Overflow's background.js)
+ *
+ * Tagged PAGE_NOT_READY: on failure, same as enableVideoMode()'s failure
+ * points — nothing has been submitted yet at this point, so runQueue()'s
+ * existing reload-and-retry logic in sidepanel.js applies unchanged.
+ */
+async function attachReferenceImage(dataUrl, fileName, mimeType) {
+	const blob = await fetch(dataUrl).then((r) => r.blob());
+	const file = new File([blob], fileName, { type: mimeType || blob.type });
+
+	// UNCONFIRMED selector — placeholder guess, needs live verification.
+	const input = document.querySelector('input[type="file"]');
+	if (!input)
+		throw new Error("PAGE_NOT_READY: Could not find the reference-image upload control on the page.");
+
+	const dataTransfer = new DataTransfer();
+	dataTransfer.items.add(file);
+	input.files = dataTransfer.files;
+	input.dispatchEvent(new Event("change", { bubbles: true }));
+	input.dispatchEvent(new Event("input", { bubbles: true }));
+
+	// UNCONFIRMED confirmation signal — placeholder guess, needs live
+	// verification (e.g. a thumbnail/chip that appears near the composer once
+	// chat.qwen.ai has actually accepted the upload).
+	const attached = await waitFor(
+		() => document.querySelector('[class*="image-upload"] img, [class*="attachment"] img'),
+		20000,
+		300,
+	);
+	if (!attached)
+		throw new Error("PAGE_NOT_READY: Could not confirm the reference image was attached.");
+}
+
+/**
  * Timestamped, greppable console output for each major step of runPrompt().
  * Added specifically because a real test hit a total silent hang — no error,
  * no status update, nothing — that none of the existing PAGE_NOT_READY /
@@ -546,8 +620,13 @@ function qvfLog(step) {
  * already on the page from a prior prompt) and relies on waitForResult() to
  * keep watching for it afterward too, so the queue can stop cleanly rather
  * than treating a limit hit as a generic per-prompt error.
+ *
+ * `image`, when present ({dataUrl, fileName, mimeType}), is attached via
+ * attachReferenceImage() before the text is typed in — see that function's
+ * comment for why the exact ordering relative to enableVideoMode() below is
+ * still a best guess pending live testing.
  */
-async function runPrompt(text) {
+async function runPrompt(text, image = null) {
 	qvfLog("runPrompt: start");
 	const preExisting = findDailyLimitMessage();
 	if (preExisting) {
@@ -564,6 +643,12 @@ async function runPrompt(text) {
 	// click/dispatch, on top of the composerReady+toolbarReady gate already
 	// checked before the queue's first RUN_PROMPT.
 	await sleep(600 + Math.random() * 900);
+
+	if (image) {
+		qvfLog("runPrompt: attachReferenceImage starting");
+		await attachReferenceImage(image.dataUrl, image.fileName, image.mimeType);
+		qvfLog("runPrompt: attachReferenceImage done");
+	}
 
 	qvfLog("runPrompt: enableVideoMode (1st call) starting");
 	await enableVideoMode();
@@ -629,6 +714,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 			composerReady: !!findPromptInput(),
 			toolbarReady: !!document.querySelector('[aria-label="Select Mode"]'),
 			loginFormReady: isLoginFormPresent(),
+			loggedIn: isLoggedIn(),
 			dailyLimitReached: !!findDailyLimitMessage(),
 			adBlockerActive,
 		});
@@ -645,7 +731,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 	}
 
 	if (message.type === "RUN_PROMPT") {
-		runPrompt(message.payload.text)
+		runPrompt(message.payload.text, message.payload.image)
 			.then((result) => sendResponse({ ok: true, ...result }))
 			.catch((err) => sendResponse({ ok: false, error: err.message }));
 		return true; // async response

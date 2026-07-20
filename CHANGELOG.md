@@ -15,6 +15,106 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-20 — Built three new features: login-on-load prompt, reference images, and clearing them with the queue
+
+- **Request**: three features, planned together first (Plan mode, with a
+  Plan agent doing the file-by-file design after research into both this
+  repo and Overflow, this extension's sister project) then implemented in
+  one pass. Three scope decisions were made with the user before writing any
+  code: (1) since `accounts` is deliberately in-memory-only and resets to
+  empty on every panel reload, the login-check re-runs both at panel load
+  *and* every time an accounts file is (re)loaded, rather than trying to
+  make it fire literally once "on first load" (which would only ever see an
+  empty account list); (2) reference images are auto-numbered by **upload
+  order** (001, 002, 003...), not parsed from user-supplied filenames; (3)
+  whether chat.qwen.ai's "Create Video" composer even has a reference-image
+  upload control at all is unconfirmed — built as a best-guess skeleton
+  (same approach the rest of `content-scripts/qwen.js` was originally built
+  with) rather than blocked on live access this session doesn't have.
+- **Feature 1 — login-on-load prompt**:
+  - **`content-scripts/qwen.js`**: added `isLoggedIn()` (best guess:
+    `!!document.querySelector("button.user-menu-btn")`, inferred from
+    `performLogout()`'s existing comment that this button disappears once
+    logged out — **not yet confirmed live**, unlike this file's other
+    selectors). PING now reports `loggedIn`.
+  - **`background.js`**: extracted `switchAccountAndWait()`'s navigate →
+    poll-login-form → login → poll-composer tail into a shared
+    `performLoginAndWaitForComposer()`. `switchAccountAndWait()` (account
+    rotation) now does `PERFORM_LOGOUT` then calls it; a new
+    `loginAccountAndWait()` (logging in from scratch, nothing to log out of)
+    calls it directly. New `LOGIN_ACCOUNT` message, mirroring the existing
+    `SWITCH_ACCOUNT` handler shape.
+  - **`sidepanel/`**: new `#confirm-overlay` modal (`.html`/`.css`) — visually
+    consistent with the existing single-button `#blocking-overlay`
+    (`.blocking-card`) but a distinct element with Yes/No buttons, since
+    `#blocking-overlay`'s documented semantics ("automation cannot proceed
+    at all") don't fit a dismissible question. `sidepanel.js` adds
+    `showConfirmModal()`/`hideConfirmModal()`, `loginAccount()` (parallel to
+    the existing `switchAccount()`), `checkLoginState()` (one-shot, guarded
+    by a `loginCheckInFlight` flag, deliberately *not* tied to
+    `checkBlockingState()`'s 3s poll — called once at panel init and again
+    inside `accountFileEl`'s change handler), and `onLoginConfirmed()` (logs
+    `accounts[0]` in, then auto-starts the queue via the new
+    `buildQueueFromPrompts()` if the textarea already has content).
+- **Feature 2 — reference images**: new `#reference-images-toggle` (same
+  `.switch` pattern as Auto-download) shows/hides `#reference-images-panel`
+  — a click/drag dropzone plus a thumbnail list, styled and wired directly
+  on Overflow's `.character-panel`/`.dropzone`/`.character-list` CSS and
+  `addCharacterFiles()`/dropzone-event pattern (visual/structural
+  inspiration only — this feature pairs images to prompts by upload-order
+  array index, not Overflow's filename-to-character-name text matching).
+  `sidepanel.js` keeps uploaded images in a new in-memory-only
+  `referenceImages` array (`{dataUrl, fileName, mimeType}`, converted via
+  `FileReader.readAsDataURL` since the content script can't reach the panel's
+  memory directly), never persisted — same convention as `queue`/`accounts`
+  — while the toggle's on/off *state* persists via the existing
+  `SETTINGS_KEY` mechanism, same as Auto-download. Numbering badges reuse
+  `downloadResult()`'s existing zero-padded convention
+  (`String(index+1).padStart(3,"0")`) so image "001" lines up with the same
+  indexing as this batch's own result filenames. `content-scripts/qwen.js`
+  gets a new `attachReferenceImage()` — a best-guess skeleton (File rebuilt
+  from the data URL, driven into a guessed file-input selector via a
+  synthetic `DataTransfer` + `change` event, then `waitFor()` a guessed
+  "attached" confirmation signal) — called from `runPrompt(text, image)`
+  before `enableVideoMode()`/`setPromptText()`, tagged `PAGE_NOT_READY:` on
+  failure so the existing reload-and-retry logic in `runQueue()` applies
+  with no changes needed there.
+- **Feature 3 — clear images with the queue**: `resetToStartingState()`
+  (already the exact function that clears the prompt textarea/queue on a
+  fully successful, zero-error, zero-limit-hit batch completion) now also
+  clears `referenceImages` and re-renders the list. The toggle itself stays
+  on, same treatment as Auto-download's own toggle/folder fields — only the
+  per-batch data clears, not the preference. The manual "Clear queue" button
+  is deliberately untouched (it already doesn't clear the prompt textarea
+  either), preserving that existing asymmetry rather than adding new
+  behavior to it.
+- **Genuinely unconfirmed, not just "not independently tested live" —
+  flagged explicitly in code comments for the next real session**:
+  `isLoggedIn()`'s selector; whether chat.qwen.ai's video composer has any
+  reference-image control at all; that control's file-input selector, if it
+  exists; whether a synthetic `DataTransfer`/`change` event is sufficient or
+  whether (like Overflow's Flow target) it needs a trusted click via
+  `chrome.debugger` (not added speculatively — this extension currently has
+  no `"debugger"` permission or `DEBUGGER_*` handlers, unlike Overflow); the
+  "image attached" confirmation signal; and whether the attach step needs to
+  happen before or after `enableVideoMode()`'s first call. All of feature 2
+  hinges on live testing against the real site to even confirm the feature
+  is possible as designed.
+- **Verified this session**: `node --check` passed on all three changed JS
+  files; no duplicate element IDs introduced in `sidepanel.html`; opened
+  `sidepanel.html` as a static file to visually confirm the new toggle,
+  dropzone, thumbnail-list, and confirm-modal markup render correctly
+  (`chrome.*` APIs aren't available outside an installed-extension context,
+  so this only checks structure/CSS, not behavior). **Not tested as an
+  installed extension** — this session's browser automation can't drive
+  `chrome://extensions`' native "Load unpacked" file picker — and login
+  credentials were never entered anywhere, by design. Next real-world test:
+  load unpacked, confirm the login-on-load modal appears/behaves correctly
+  with a real accounts file and a logged-out session; enable reference
+  images, upload a few, and use the Log tab to see exactly where
+  `attachReferenceImage()` succeeds or fails against the live composer —
+  that trace is what will resolve the "genuinely unconfirmed" list above.
+
 ## 2026-07-20 — Confirmed ad-blocker detection working live; simplified the overlay message
 
 - **Confirmed live**: the two-bait-URL fix from the previous entry works —
