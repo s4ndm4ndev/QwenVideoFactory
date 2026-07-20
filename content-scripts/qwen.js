@@ -126,7 +126,10 @@ function findGenerateButton() {
  */
 async function setPromptText(text) {
 	const input = findPromptInput();
-	if (!input) throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
+	if (!input) {
+		qvfLog("setPromptText: prompt input not found on the page");
+		throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
+	}
 
 	const nativeSetter = Object.getOwnPropertyDescriptor(
 		window.HTMLTextAreaElement.prototype,
@@ -196,8 +199,10 @@ async function enableVideoMode() {
 	// — unlike a failure after Send is actually clicked, where a retry could
 	// double-submit (see the plain, untagged errors after button.click() in
 	// runPrompt() below, and waitForResult()'s own timeout).
-	if (!trigger)
+	if (!trigger) {
+		qvfLog("enableVideoMode: mode-select trigger not found after waiting 20s");
 		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger on the page.");
+	}
 	trigger.click();
 
 	// Small human-paced delay before picking the menu item, as if someone
@@ -213,15 +218,19 @@ async function enableVideoMode() {
 		20000,
 		200,
 	);
-	if (!item)
+	if (!item) {
+		qvfLog("enableVideoMode: 'Create Video' option not found in the mode menu after waiting 20s");
 		throw new Error(
 			"PAGE_NOT_READY: Could not find the 'Create Video' option in the mode menu.",
 		);
+	}
 	item.click();
 
 	const enabled = await waitFor(isVideoModeOn, 20000, 200);
-	if (!enabled)
+	if (!enabled) {
+		qvfLog("enableVideoMode: clicked 'Create Video' but the mode pill never appeared within 20s");
 		throw new Error("PAGE_NOT_READY: Selected 'Create Video' but video mode did not turn on.");
+	}
 }
 
 /**
@@ -554,8 +563,26 @@ function sleep(ms) {
  * list includes image/png, image/jpeg, etc. among many other file types).
  * The uploaded image's preview renders as <img class="vision-item-image">
  * (56x56, src on chat.qwen.ai's own OSS CDN — a real network upload, not an
- * instant local blob preview, hence the generous wait below) — confirmed via
- * direct inspection, not guessed.
+ * instant local blob preview) — confirmed via direct inspection, not
+ * guessed. Below a size threshold the thumbnail appears almost immediately;
+ * above it, the composer shows a plain filename+size chip (e.g. "photo.jpeg
+ * 1.2 MB") while the upload is still in flight, which only later turns into
+ * the vision-item-image thumbnail once the upload finishes.
+ *
+ * CONFIRMED LIVE (2026-07-20, second round, via Claude in Chrome against the
+ * user's real logged-in session): a 20s confirmation timeout — this
+ * function's original value — is nowhere near generous enough for a
+ * realistically-sized reference image. A ~1.6MB test upload, run against
+ * this same live session with network-request tracing on, took ~45 seconds
+ * end-to-end (chat.qwen.ai's own analytics beacon reported the upload
+ * duration directly: `FileUpload-AllTime` fired with a ~44663ms timing
+ * value), confirmed by the img.vision-item-image thumbnail only appearing at
+ * that point — not a logic bug in the attach sequence itself, which was
+ * otherwise confirmed working end-to-end (real OSS CDN upload observed via
+ * the network log). This is what "Could not confirm the reference image was
+ * attached" / "no new img.vision-item-image appeared... likely failed or is
+ * taking longer than 20s" turned out to actually be: not a failure, just an
+ * upload still genuinely in progress when the old timeout gave up.
  *
  * Tagged PAGE_NOT_READY: on failure, same as enableVideoMode()'s failure
  * points — nothing has been submitted yet at this point, so runQueue()'s
@@ -566,31 +593,43 @@ async function attachReferenceImage(dataUrl, fileName, mimeType) {
 	const file = new File([blob], fileName, { type: mimeType || blob.type });
 
 	const trigger = document.querySelector('[aria-label="Select Mode"]');
-	if (!trigger)
+	if (!trigger) {
+		qvfLog("attachReferenceImage: mode-select trigger not found on the page");
 		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger to open the upload menu.");
+	}
 	trigger.click();
 
 	// Small human-paced delay before picking the menu item, same rationale as
 	// enableVideoMode()'s identical pause.
 	await sleep(250 + Math.random() * 400);
 
+	// 20s, not the original 5s: confirmed live (2026-07-20, third round) that
+	// this specific item can fail to render in time even when the rest of the
+	// toolbar (composerReady+toolbarReady) already looks ready, especially
+	// right after a reload — enableVideoMode()'s equivalent wait for the
+	// "Create Video" item in this exact same dropdown already gets 20s; there
+	// was never a real reason for this item to get 4x less margin.
 	const uploadItem = await waitFor(
 		() =>
 			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
 				li.textContent.includes("Upload attachment"),
 			),
-		5000,
+		20000,
 		200,
 	);
-	if (!uploadItem)
+	if (!uploadItem) {
+		qvfLog("attachReferenceImage: 'Upload attachment' option not found in the mode menu after waiting 20s");
 		throw new Error("PAGE_NOT_READY: Could not find the 'Upload attachment' option in the mode menu.");
+	}
 	uploadItem.click();
 
 	await sleep(250 + Math.random() * 400);
 
 	const input = document.getElementById("filesUpload");
-	if (!input)
+	if (!input) {
+		qvfLog("attachReferenceImage: #filesUpload input not found on the page");
 		throw new Error("PAGE_NOT_READY: Could not find the reference-image upload control on the page.");
+	}
 
 	// Snapshot existing preview thumbnails before uploading, so the
 	// confirmation check below recognizes a genuinely NEW one appearing —
@@ -606,19 +645,22 @@ async function attachReferenceImage(dataUrl, fileName, mimeType) {
 	input.dispatchEvent(new Event("change", { bubbles: true }));
 	input.dispatchEvent(new Event("input", { bubbles: true }));
 
-	// Generous timeout: confirmed live this is a real upload to chat.qwen.ai's
-	// own CDN, not an instant local preview.
+	// 90s timeout: confirmed live (see this function's header comment) that a
+	// real, realistically-sized image upload can genuinely take ~45s end to
+	// end — the original 20s value was simply too short for a real upload,
+	// not a sign anything was actually broken.
+	qvfLog("attachReferenceImage: file dispatched, waiting for upload to complete (can take up to ~90s)");
 	const newImg = await waitFor(
 		() =>
 			Array.from(document.querySelectorAll("img.vision-item-image")).find(
 				(img) => img.src && !alreadyPresentImgSrcs.has(img.src),
 			),
-		20000,
+		90000,
 		300,
 	);
 	if (!newImg) {
 		qvfLog(
-			"attachReferenceImage: no new img.vision-item-image appeared after uploading — the upload likely failed or is taking longer than 20s",
+			"attachReferenceImage: no new img.vision-item-image appeared within 90s — the upload likely genuinely failed this time",
 		);
 		throw new Error("PAGE_NOT_READY: Could not confirm the reference image was attached.");
 	}
@@ -667,9 +709,21 @@ function qvfLog(step) {
  * than treating a limit hit as a generic per-prompt error.
  *
  * `image`, when present ({dataUrl, fileName, mimeType}), is attached via
- * attachReferenceImage() before the text is typed in — see that function's
- * comment for why the exact ordering relative to enableVideoMode() below is
- * still a best guess pending live testing.
+ * attachReferenceImage() AFTER the text is typed in but BEFORE video mode is
+ * turned on. Two live tests now bracket the correct spot: putting the attach
+ * step before setPromptText() (the original order) had it racing ahead of
+ * the prompt text with no dependency on the page being settled; moving it
+ * all the way to the end, after enableVideoMode(), was confirmed LIVE to
+ * break the upload outright — with "Create Video" mode already selected, the
+ * mode-select dropdown no longer offers an "Upload attachment" entry at all,
+ * and attachReferenceImage() fails with "Could not find the 'Upload
+ * attachment' option in the mode menu." So the mode-select dropdown must
+ * still be in its no-mode-chosen state when attachReferenceImage() opens it,
+ * which means it has to run before enableVideoMode()'s first call — but
+ * nothing stops it from running after setPromptText(), which is what
+ * addresses the original request. Not yet independently confirmed live in
+ * this exact order (text → image → video mode); it's the only remaining
+ * ordering consistent with both live results above, not a fresh guess.
  */
 async function runPrompt(text, image = null) {
 	qvfLog("runPrompt: start");
@@ -680,7 +734,10 @@ async function runPrompt(text, image = null) {
 	}
 
 	const input = findPromptInput();
-	if (!input) throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
+	if (!input) {
+		qvfLog("runPrompt: prompt input not found on the page at entry");
+		throw new Error("PAGE_NOT_READY: Could not find the prompt input on the page.");
+	}
 
 	// Small settle delay before the first interaction on this page load, as if
 	// someone glanced at the fresh chat before starting to work — also gives a
@@ -688,6 +745,13 @@ async function runPrompt(text, image = null) {
 	// click/dispatch, on top of the composerReady+toolbarReady gate already
 	// checked before the queue's first RUN_PROMPT.
 	await sleep(600 + Math.random() * 900);
+
+	qvfLog("runPrompt: setPromptText starting");
+	await setPromptText(text);
+	qvfLog(
+		"runPrompt: setPromptText done, live textarea value length=" +
+			(findPromptInput() ? findPromptInput().value.length : "no textarea found"),
+	);
 
 	if (image) {
 		qvfLog("runPrompt: attachReferenceImage starting");
@@ -699,26 +763,19 @@ async function runPrompt(text, image = null) {
 	await enableVideoMode();
 	qvfLog("runPrompt: enableVideoMode (1st call) done, videoModeOn=" + isVideoModeOn());
 
-	qvfLog("runPrompt: setPromptText starting");
-	await setPromptText(text);
-	qvfLog(
-		"runPrompt: setPromptText done, live textarea value length=" +
-			(findPromptInput() ? findPromptInput().value.length : "no textarea found"),
-	);
-
 	// Short randomized pause before submitting, as if someone typed the
 	// prompt and glanced over it, rather than submitting the instant the
 	// field is filled (same rationale as Overflow's flow.js).
 	await sleep(600 + Math.random() * 1200);
 
 	// Re-check right before submitting rather than trusting enableVideoMode()'s
-	// earlier confirmation: on a brand-new chat (no session yet, composer's
-	// very first render), typing the prompt text has been observed to redraw
-	// the composer — the aspect-ratio control that only appears once "Create
-	// Video" is on mounts around here — and that redraw can silently drop the
-	// mode pill back to nothing, so the prompt goes out as a normal text chat
-	// instead of a video generation with no error raised anywhere. Re-assert
-	// it here, at the last moment before clicking Send.
+	// earlier confirmation. Originally this guarded against typing the prompt
+	// text dropping a mode pill that was already on — no longer possible now
+	// that setPromptText()/attachReferenceImage() both run before
+	// enableVideoMode()'s first call above — but kept as defense in depth for
+	// any other redraw between here and Send (e.g. the aspect-ratio control
+	// that only appears once "Create Video" is on mounting late) that could
+	// silently drop the mode pill with no error raised anywhere.
 	if (!isVideoModeOn()) {
 		qvfLog("runPrompt: video mode dropped before Send, re-enabling (2nd call)");
 		await enableVideoMode();
@@ -727,7 +784,10 @@ async function runPrompt(text, image = null) {
 
 	qvfLog("runPrompt: looking for the submit button");
 	const button = findGenerateButton();
-	if (!button) throw new Error("PAGE_NOT_READY: Could not find the submit button.");
+	if (!button) {
+		qvfLog("runPrompt: submit button not found on the page");
+		throw new Error("PAGE_NOT_READY: Could not find the submit button.");
+	}
 	qvfLog("runPrompt: clicking Send, entering waitForResult()");
 	button.click();
 

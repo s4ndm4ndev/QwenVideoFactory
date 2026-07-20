@@ -15,6 +15,208 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-20 — The new logging paid off immediately: found the "Upload attachment" menu item gets 4x less wait time than the equivalent "Create Video" check, for no real reason
+
+- **Request**: the user ran a batch and shared three screenshots from a real
+  failure. Thanks to the previous entry's logging fix, the Log tab now named
+  the exact failure for the first time:
+  `attachReferenceImage: 'Upload attachment' option not found in the mode
+  menu after waiting 5s` — confirming the instrumentation worked as
+  intended.
+- **Found a real, concrete bug**: `attachReferenceImage()`'s wait for the
+  "Upload attachment" menu item was hardcoded to 5000ms, while
+  `enableVideoMode()`'s wait for "Create Video" — the exact same shape of
+  check, same dropdown, same `li.mode-select-common-item` selector — gets a
+  full 20000ms. There was never a documented reason for this asymmetry; it
+  looks like an oversight from whenever `attachReferenceImage()` was first
+  written, not a deliberate choice.
+- **`content-scripts/qwen.js`**: widened this wait from 5000ms to 20000ms to
+  match `enableVideoMode()`'s equivalent check, with a comment noting the
+  live evidence and the asymmetry that motivated it. Updated the failure
+  qvfLog() to say "after waiting 20s" to match.
+- **Also visible in the same screenshots, worth flagging separately**: two
+  distinct chat.qwen.ai-side page errors recurred on essentially every fresh
+  reload in this session — `Uncaught TypeError: Cannot read properties of
+  undefined (reading '1')` from `jquery.min.js`, and in one reload, the
+  actual `Minified React error #418` hydration crash this project's history
+  (2026-07-19) already correlated with ad/tracker-blocking interference. The
+  extension's own ad-blocker hard-block overlay did not appear during this
+  session despite the crash recurring, meaning whatever is causing it here
+  isn't tripping the two specific bait URLs (`static.doubleclick.net`,
+  `pagead2.googlesyndication.com`) `refreshAdBlockerStatus()` currently
+  checks. Not fixed this entry — flagged for the user to check (any ad
+  blocker, privacy extension, or DNS-level blocking currently active) and
+  for a future entry if it turns out to still matter after this timeout fix.
+- **Not independently re-tested live** — the fix is narrowly scoped and
+  directly evidenced by this session's own Log tab output, but hasn't itself
+  been run against a real batch yet. Next real-world test: run a batch with
+  reference images again; if item 1 still fails, the Log tab will now show
+  either a different, more specific reason (progress), or the same "not
+  found after waiting 20s" (meaning the underlying page-side crash is severe
+  enough to block this for over 20s, at which point the ad-blocker/hydration
+  question above becomes the real next lead, not another timeout bump).
+
+## 2026-07-20 — Closed a logging blind spot: most PAGE_NOT_READY failure points threw silently, with no way to tell which check failed on a given attempt
+
+- **Request**: the user reported the first attempt at a prompt keeps
+  failing regardless of which underlying issue gets fixed, and it always
+  takes a reload-retry to succeed — asked why this keeps happening and
+  whether it can actually be fixed, understandably frustrated after several
+  rounds of this.
+- **Traced through the actual log gap**: a real transcript showed
+  `setPromptText done` → `attachReferenceImage starting` → **20+ seconds of
+  nothing** → a fresh `runPrompt: start` for the next item, with no
+  completion, error, or reason logged anywhere in between for the first
+  attempt. Reading through every `PAGE_NOT_READY:`-tagged throw site in
+  `content-scripts/qwen.js` explains why: only one of `attachReferenceImage()`'s
+  four failure points (the final upload-confirmation timeout) ever called
+  `qvfLog()` before throwing. The other three there, both of
+  `setPromptText()`'s/`runPrompt()`'s prompt-input checks, `enableVideoMode()`'s
+  three failure points, and `runPrompt()`'s submit-button check all threw
+  completely silently. Whatever failed on that first attempt was real and is
+  presumably still happening — there was simply no way to ever see which
+  check it was, since the reload-and-retry that follows a `PAGE_NOT_READY`
+  wipes the console (`Console was cleared` from the page reload) and the
+  sidepanel's own retry status text was a generic "reloading and retrying",
+  never the actual reason.
+- **`content-scripts/qwen.js`**: added a `qvfLog()` call immediately before
+  every previously-silent `PAGE_NOT_READY:` throw (both `findPromptInput()`
+  checks, all three of `enableVideoMode()`'s, all three of
+  `attachReferenceImage()`'s pre-upload checks, and the submit-button check),
+  naming exactly which precondition failed.
+- **`sidepanel/sidepanel.js`**: the reload-and-retry status line (`runQueue()`)
+  now includes the actual (tag-stripped) failure reason —
+  `` chat.qwen.ai wasn't ready (<reason>) — reloading and retrying... `` —
+  instead of a generic message that looked identical no matter which check
+  actually failed.
+- **This is not itself a fix for whatever is failing on the first attempt**
+  — it's instrumentation, deliberately, since guessing a specific selector or
+  timing fix without knowing which of ~8 different checks is actually
+  failing would just be another round of the same guessing loop the user is
+  reasonably tired of. The next test run's Log tab (or the retry status
+  line, now that it carries the reason too) will name the exact failing
+  check directly, turning "why does this keep happening" into an answerable
+  question instead of another guess.
+- **Next step**: run a batch again and, if the first-attempt failure recurs,
+  check the Log tab (or Copy it) for whichever new line fired right before
+  the reload — that pinpoints the real root cause for a real fix, rather
+  than guessing at ordering/timing again.
+
+## 2026-07-20 — Found the real cause of the reference-image "could not confirm attached" failure via live network tracing: a 20s timeout was just too short for a real upload
+
+- **Request**: the user tested the previous entry's text→image→video-mode
+  reorder live. It "kind of worked" but was flaky — the page reloaded (the
+  auto-retry logic) a few times before an attach finally succeeded on the
+  third try, then a later item timed out again with the same "Could not
+  confirm the reference image was attached." error. Asked to properly
+  synchronize these steps instead of continuing to guess.
+- **Investigated live** (Claude in Chrome, the user's own real, already
+  logged-in chat.qwen.ai session — no credentials entered) rather than guess
+  a fourth time. First re-confirmed the previous entry's fix actually holds:
+  with "Create Video" mode already selected, the mode-select dropdown *does*
+  still offer "Upload attachment" (contradicting the read of the very first
+  live investigation that motivated last entry's reorder) — so the "menu
+  item not found" failure from two entries ago was specific to that run, not
+  a structural rule. The real, reproducible issue is different: dispatching
+  a tiny (68-byte) test file produces a confirmed `img.vision-item-image`
+  with a real OSS CDN `src` in a few seconds every time, exactly as
+  originally documented — but dispatching a realistically-sized file (tested
+  at ~1.6MB, close to a real reference photo) instead renders a plain
+  filename+size chip (e.g. "mid-test.png 1.6 MB") that sits there with *zero*
+  network upload activity for many seconds, then eventually — confirmed via
+  chat.qwen.ai's own analytics beacon, which reports the upload's timing
+  directly — completes after **~45 seconds**, at which point it does turn
+  into a real `img.vision-item-image`. The 20-second confirmation timeout
+  `attachReferenceImage()` has had since it was first written was simply
+  never enough for a real-sized image; every previous "failure" and the
+  flaky reload-retry-eventually-works pattern the user just described is
+  fully explained by this alone.
+- **`content-scripts/qwen.js`**: widened `attachReferenceImage()`'s
+  confirmation `waitFor()` from 20000ms to 90000ms (real observed time was
+  ~45s; doubled for margin against slower connections/larger images). Added
+  a qvfLog() line right after dispatch so the Log tab shows the wait is in
+  progress, not silent, and updated the function's header comment and
+  failure-log wording with the live network-tracing evidence above.
+- **`sidepanel/sidepanel.js`**: `runQueue()`'s outer `withTimeout()` guard
+  around the whole `RUN_PROMPT` call was calculated (2026-07-19) before
+  reference images existed and no longer generously covers the worst case
+  once a ~90s upload wait is added on top of `enableVideoMode()`'s own
+  up-to-two ~60s attempts and `waitForResult()`'s 180s — widened from 6
+  minutes (360000ms) to 8 minutes (480000ms), with the comment and the
+  CONNECTION_LOST message text updated to match, so a legitimately slow but
+  successful upload can no longer be killed by the outer timeout instead of
+  the inner one.
+- **Confirmed live via direct network-request tracing, not reasoned through
+  blind** — the ~45s figure came from chat.qwen.ai's own
+  `FileUpload-AllTime` analytics beacon (`c6` param, milliseconds) during a
+  real dispatch against the user's live session, not an estimate. The
+  ordering fix from the previous entry (text → image → video mode) was not
+  changed, since the menu-item-availability problem it fixed didn't actually
+  reproduce in this session's live re-check. Next real-world test: run a
+  batch with reference images (ideally photo-sized, not tiny) and confirm in
+  the Log tab that `attachReferenceImage: file dispatched, waiting for
+  upload...` is followed by a success line well before the new 90s bound,
+  with no more spurious PAGE_NOT_READY reload-retries for this step.
+
+## 2026-07-20 — Reordering reference-image upload after video mode broke the upload; moved it to run after the prompt text but still before video mode
+
+- **Request**: the user tested the previous entry's reorder live. Item 1
+  failed with `"Could not find the 'Upload attachment' option in the mode
+  menu."`, and the Log tab confirmed it: `enableVideoMode (1st call) done,
+  videoModeOn=true` → `setPromptText done` → `attachReferenceImage starting`
+  → (error, no `attachReferenceImage done`).
+- **Root cause**: with "Create Video" mode already selected, opening the
+  mode-select dropdown (`[aria-label="Select Mode"]`) no longer offers an
+  "Upload attachment" entry at all — that option apparently only exists in
+  the dropdown's no-mode-chosen state, alongside "Create Video" as a sibling
+  entry (per the earlier live investigation that first confirmed the attach
+  flow). The previous entry's assumption — that the upload-menu click was
+  "confirmed independent of video-mode state" — turned out to only cover the
+  file-dispatch step *after* the menu item was already found and clicked,
+  not whether the menu item is even present once a mode is active. Moving
+  `attachReferenceImage()` to run after `enableVideoMode()` broke it outright.
+- **`content-scripts/qwen.js`**: reordered `runPrompt()` again —
+  `setPromptText()` first (addresses the original report: image no longer
+  uploads before the prompt is typed), then `attachReferenceImage()` (if
+  present) while the mode-select dropdown is still in its pre-mode state,
+  then `enableVideoMode()` last. Updated both the `runPrompt()` doc comment
+  and the re-check-before-Send comment (which previously described a
+  typing-drops-the-mode-pill risk that no longer applies now that typing
+  happens before video mode is enabled, not after) to match.
+- **Not independently tested live** — this exact order (text → image → video
+  mode) is the only one consistent with both live results so far (the
+  original order's image-before-text race, and this session's
+  image-after-video-mode failure), not a fresh guess, but hasn't itself been
+  run against the real site yet. Next real-world test: run a batch with
+  reference images enabled and confirm in the Log tab that
+  `attachReferenceImage: starting` logs after `setPromptText: done` but
+  `enableVideoMode (1st call) starting` logs after `attachReferenceImage:
+  done`, and that the image still attaches successfully.
+
+## 2026-07-20 — Reordered reference-image upload to run after the prompt is typed, not before
+
+- **Request**: the user reported the upload mechanism was firing before the
+  prompt text got typed in, and even before the page had fully materialized
+  — asked to sync the two steps, or upload the image only after the text.
+- **Root cause**: `runPrompt()`'s call order had `attachReferenceImage()`
+  first, before `enableVideoMode()`/`setPromptText()`. `attachReferenceImage()`
+  does its own independent page interaction (opening the mode-select
+  dropdown, clicking "Upload attachment", dispatching the file input) gated
+  only by the initial 600–1500ms settle delay — no dependency on the composer
+  having proven itself interactive first. That made it the very first real
+  interaction with a freshly loaded page on any prompt with a reference
+  image, exactly matching the report.
+- **`content-scripts/qwen.js`**: reordered `runPrompt()` so
+  `attachReferenceImage()` now runs after `enableVideoMode()` (1st call) and
+  `setPromptText()`, right before the pre-Send pause — a pure reorder, no
+  changes to any of the three functions' own logic or selectors. Safe per the
+  previous entry's finding that the upload-menu click works independent of
+  video-mode state, so there's no correctness reason it needed to go first.
+  Updated the doc comment above `runPrompt()` to match.
+- **Superseded by the entry above the same day** — this order was live-tested
+  next and confirmed broken; kept here for the historical record of the
+  guessing sequence, per this changelog's convention.
+
 ## 2026-07-20 — Found and fixed the real cause of the reference-image attach failure, via direct live DOM investigation
 
 - **Request**: the previous entry's fix (confirmed file-input selector, new

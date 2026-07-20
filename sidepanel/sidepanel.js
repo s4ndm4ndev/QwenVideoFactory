@@ -971,17 +971,21 @@ async function runQueue() {
 		setStatus(`Running ${submittedCount + 1} of ${queue.length}...`, "running");
 
 		// Bounded well above the legitimate worst case (settle delay +
-		// enableVideoMode's up-to-two attempts at ~60s each + typing +
-		// waitForResult()'s own 180s) so a real, still-in-progress generation
-		// is never mistaken for a hang — see withTimeout()'s comment for why
-		// this exists at all.
+		// attachReferenceImage's up to ~90s upload wait (confirmed live: a real
+		// image upload can genuinely take ~45s, see that function's header
+		// comment) + enableVideoMode's up-to-two attempts at ~60s each + typing
+		// + waitForResult()'s own 180s ≈ 6.8 minutes) so a real, still-in-progress
+		// generation is never mistaken for a hang — see withTimeout()'s comment
+		// for why this exists at all. Widened from 6 to 8 minutes when the
+		// reference-image upload wait was added, since that alone eats most of
+		// the previous budget's slack.
 		const result = await withTimeout(
 			sendToContent("RUN_PROMPT", { text: queue[i].text, image: queue[i].referenceImage || null }),
-			360000,
+			480000,
 			{
 				ok: false,
 				error:
-					"CONNECTION_LOST: No response from chat.qwen.ai after 6 minutes — the page likely became unresponsive or silently reloaded.",
+					"CONNECTION_LOST: No response from chat.qwen.ai after 8 minutes — the page likely became unresponsive or silently reloaded.",
 			},
 		);
 
@@ -1030,8 +1034,9 @@ async function runQueue() {
 			const attempts = (queue[i].pageNotReadyRetries || 0) + 1;
 			queue[i].pageNotReadyRetries = attempts;
 			if (attempts <= 2) {
+				const reason = (result.error || "").replace(/^PAGE_NOT_READY:\s*/, "");
 				setStatus(
-					`chat.qwen.ai didn't finish loading — reloading and retrying (attempt ${attempts})...`,
+					`chat.qwen.ai wasn't ready (${reason}) — reloading and retrying (attempt ${attempts})...`,
 					"running",
 				);
 				const refresh = await refreshQwenTab();
