@@ -15,6 +15,218 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-20 — Confirmed ad-blocker detection working live; simplified the overlay message
+
+- **Confirmed live**: the two-bait-URL fix from the previous entry works —
+  with AdGuard enabled, the blocking overlay now appears as intended. First
+  live confirmation of this feature after three prior attempts (side-panel
+  DOM bait, then a single network bait URL, both confirmed dead ends via
+  direct evidence rather than guesswork).
+- **`sidepanel/sidepanel.js`**: trimmed `showAdBlockerOverlay()`'s message
+  from "An ad blocker was detected. It's been correlated with
+  chat.qwen.ai's composer silently breaking during testing — disable it for
+  this site, then re-check." down to "An ad blocker was detected. Disable
+  it for this site, then re-check." — the backstory belongs in this
+  changelog, not in a UI message the user has to read every time the
+  overlay shows.
+
+## 2026-07-20 — The network-bait URL itself wasn't blocked by this AdGuard config; added a second, industry-standard bait URL
+
+- **Request**: the user re-tested the network-bait fix. The status bar still
+  showed "ready to start," no overlay — but their own DevTools console
+  showed AdGuard actively blocking an unrelated Alibaba tracking request
+  (`7w3ukp.tdum.alibaba.com/dss.js`, `ERR_BLOCKED_BY_CLIENT`) on the very
+  same chat.qwen.ai page, proving AdGuard genuinely was active and blocking
+  *something* there.
+- **Root cause**: this project's specific bait URL
+  (`pagead2.googlesyndication.com/pagead/js/adsbygoogle.js`) simply isn't on
+  this user's AdGuard filter set, even though other trackers on the same
+  page are — plausible, since that particular Google script is a common
+  allowlist/compatibility exception in several filter lists. Not a wiring
+  bug, and not the structural issue from two entries ago either (network
+  requests from a content script are attributed to the page, unlike DOM
+  visibility) — just an unlucky choice of single bait URL, and a single URL
+  was always going to be fragile to exactly this kind of per-blocker
+  filter-list variance.
+- **`content-scripts/qwen.js`**: `refreshAdBlockerStatus()` now checks two
+  independent bait URLs via `Promise.allSettled`, flagging
+  `adBlockerActive` if *either* fails:
+  `static.doubleclick.net/instream/ad_status.js` (the de facto industry-
+  standard ad-blocker-detection resource — the same one libraries like
+  just-detect-adblock use, blocked by essentially every major filter list
+  specifically because publishers already rely on it for this exact
+  purpose) plus the existing `pagead2.googlesyndication.com` one (blocked by
+  other configurations even if not this one). One misallowlisted URL can no
+  longer defeat the whole check.
+- **Not independently tested live** — same tooling constraint as every
+  other entry today. Next real-world test, AdGuard still enabled: confirm
+  the overlay now appears. If it somehow still doesn't, the next diagnostic
+  step is checking the Network tab directly for these two specific bait
+  requests (filter by "ad_status" or "adsbygoogle") to see whether either
+  one shows `ERR_BLOCKED_BY_CLIENT`, rather than guessing a fourth URL
+  blind.
+
+## 2026-07-20 — Ad-blocker detection still didn't trip against AdGuard; replaced the cosmetic bait with a real network-request check
+
+- **Request**: the user re-tested with AdGuard enabled after the previous
+  entry's fix (moving the bait element onto chat.qwen.ai's own page). The
+  extension still never showed the blocking overlay. Rather than guess a
+  third time, asked the user to check the bait element directly via
+  DevTools on the chat.qwen.ai tab.
+- **Live evidence**: `document.getElementById('qvf-ad-bait')` →
+  `offsetHeight: 1, display: "block"` — the element was correctly placed
+  and present, but AdGuard simply wasn't hiding it. This rules out a wiring
+  bug: the cosmetic-hiding approach itself doesn't work against AdGuard.
+  Most likely cause: modern ad blockers (AdGuard among them) have started
+  deliberately leaving well-known honeypot elements (`adsbygoogle`,
+  `ad-banner`, etc.) unhidden specifically to defeat sites' anti-adblock
+  detection scripts — the same arms race that motivated this feature.
+  Cosmetic-filter-based detection is fundamentally unreliable against a
+  blocker built to resist exactly that.
+- **`content-scripts/qwen.js`**: replaced the DOM bait element and
+  `isAdBlockerActive()` entirely with a network-based check,
+  `refreshAdBlockerStatus()` — a `fetch()` (mode: `"no-cors"`, so no CORS
+  headers are needed and any successful response resolves) against the
+  exact `pagead2.googlesyndication.com` ad-script URL this project observed
+  being blocked (`ERR_BLOCKED_BY_CLIENT`) during the 2026-07-19
+  hydration-crash investigation. A blocker can hide a honeypot `<div>`
+  without consequence, but it can't skip blocking a real ad-network request
+  without also just not blocking ads — a much harder signal to fake. Run
+  once on content-script load and re-checked every 20s (not on every 3s
+  panel PING, to avoid a network round-trip on every poll); the module-level
+  `adBlockerActive` it maintains is what PING now reports, same field name
+  as before so `sidepanel.js` needed no changes beyond a doc-comment update.
+  Also added a `REFRESH_AD_BLOCKER` message the content script handles by
+  awaiting a fresh `refreshAdBlockerStatus()` before responding — needed
+  because the overlay's "Re-check now" button would otherwise only ever see
+  the last 20s-old cached value via a plain PING, leaving it looking like it
+  didn't work for up to 20s right after actually disabling the blocker.
+  `sidepanel.js`'s `checkBlockingState()` takes a `forceAdBlockerRefresh`
+  option that sends this before its PING; the button passes it, the regular
+  3s idle poll doesn't.
+- **Trade-off worth noting**: this sends a periodic real request to a
+  Google ad-serving domain (an opaque, cookie-less `no-cors` fetch, not
+  meaningfully different from a tracking pixel any ad-supported site would
+  load anyway) purely to test whether it's blocked. Necessary for the
+  detection to mean anything, but worth being aware of if it's ever a
+  concern.
+- **Not independently tested live** — same tooling constraint as every
+  other entry today. Next real-world test: with AdGuard still enabled,
+  confirm the overlay now appears within ~20s of opening the panel (or
+  immediately if `refreshAdBlockerStatus()`'s first check already landed
+  before the panel's first PING); disable AdGuard and confirm "Re-check
+  now" clears it without waiting for the next interval tick.
+
+## 2026-07-20 — Fixed an uncaught "Extension context invalidated" error from the new Log broadcast
+
+- **Request**: before testing either of today's two new features, the user
+  saw an uncaught `Error: Extension context invalidated.` in
+  `chrome://extensions`'s Errors page, stack trace pointing at
+  `content-scripts/qwen.js:478` — a plain object literal
+  (`extractResult()`'s `{ url, mediaType: "video" }` return value) that
+  cannot itself throw. Chrome's error reporting for this specific error
+  class doesn't carry a real stack, so the reported location is
+  circumstantial, not the actual cause.
+- **Root cause**: `qvfLog()`'s new panel broadcast
+  (`chrome.runtime.sendMessage(...).catch(() => {})`, added earlier today)
+  only guards against the message being *rejected* — a missing panel
+  listener. It does not guard against the call itself *throwing
+  synchronously*, which is exactly what `chrome.runtime.sendMessage()` does
+  when called from a content-script instance left over from before the
+  extension was reloaded (a normal dev-workflow situation: an already-open
+  chat.qwen.ai tab whose content script never got a fresh page load after
+  the reload). A `.catch()` never gets attached in that case, because the
+  exception propagates before `sendMessage()` ever returns a promise.
+- **`content-scripts/qwen.js`**: wrapped `qvfLog()`'s broadcast in a
+  try/catch around the whole call, not just a promise `.catch()`, silently
+  swallowing both failure modes the same way (missing listener, or a fully
+  invalidated context).
+- **Not independently tested live** — same tooling constraint as the rest
+  of today's entries. Next real-world test: reload the extension, then
+  either refresh the chat.qwen.ai tab or open a fresh one before starting a
+  batch (the stale-tab scenario itself isn't “fixed” — it can't be, from
+  inside a dead context — this just stops it from surfacing as a crash).
+
+## 2026-07-20 — Fixed ad-blocker detection never tripping: the bait element was in the wrong page
+
+- **Request**: the user tested the previous entry's two new features. The
+  Log tab worked. Ad-blocker detection did not: with AdGuard installed and
+  enabled, the panel never showed the blocking overlay.
+- **Root cause**: the bait element (`#ad-bait`) lived in the side panel's
+  own `chrome-extension://` page, not on chat.qwen.ai. Chrome does not let
+  one extension's content scripts run inside another extension's UI
+  surfaces — an ad blocker's cosmetic-filtering content script has no way
+  to ever see, let alone hide, an element sitting in this extension's own
+  side panel. The detection was checking a page no real ad blocker could
+  reach, so it could never trip, regardless of which blocker or how it was
+  configured. (The correlated evidence that motivated this feature in the
+  first place — blocked `pagead2.googlesyndication.com` requests — was
+  always observed on chat.qwen.ai's own page, which in hindsight was
+  already the tell that detection belonged there too.)
+- **`content-scripts/qwen.js`**: moved the bait element and
+  `isAdBlockerActive()` here, created once at content-script injection time
+  (so it has the page's full lifetime to be caught by cosmetic filters
+  before it's ever read) and appended to chat.qwen.ai's own DOM. The PING
+  handler's response now includes `adBlockerActive`, alongside the existing
+  `composerReady`/`toolbarReady`/`loginFormReady`/`dailyLimitReached`
+  fields.
+- **`sidepanel/sidepanel.js`**: removed the non-functional local bait
+  element/check entirely. `checkBlockingState()` now reads
+  `ping.adBlockerActive` from the PING response instead — which also
+  simplified the control flow, since it no longer needs to guess whether to
+  check the ad blocker before or independent of tab presence; one PING call
+  now answers both questions together.
+- **`sidepanel/sidepanel.html`/`sidepanel.css`**: removed the dead
+  `#ad-bait` element and its styling.
+- **Not independently tested live** — same tooling constraint noted in the
+  previous entry. Next real-world test (with AdGuard still enabled) should
+  confirm the blocking overlay now appears within one poll tick.
+
+## 2026-07-20 — Built the two features planned yesterday: an in-panel Log tab, and a hard ad-blocker block
+
+- **Request**: implement the two features recorded as planning notes in the
+  previous entry, without building either yet. Before implementing, three
+  scope questions were clarified: the Log tab carries only the content
+  script's `qvfLog()` output (not panel/background events too); ad-blocker
+  detection uses a cosmetic bait element, not a network bait request; and
+  the block is an idle-time gate only — it stops a new batch from starting
+  but never interrupts one already running.
+- **Log tab** (`content-scripts/qwen.js`, `sidepanel/sidepanel.{html,js,css}`):
+  `qvfLog()` now broadcasts each step to the panel via
+  `chrome.runtime.sendMessage({ target: "panel", type: "QVF_LOG", ... })`,
+  the same broadcast-and-swallow-if-no-listener pattern `background.js`
+  already uses for `QWEN_FOCUS_CHANGED` — no `background.js` relay changes
+  needed, since panel-targeted messages were already documented as
+  broadcast-as-is. The side panel's tab-switch handler (previously a
+  hardcoded controls/about boolean) is now a generic map over
+  `{ controls, about, log }`, so adding the third tab didn't need new
+  branching logic. Log entries are kept in memory only (same convention as
+  the prompt queue and accounts list — never `chrome.storage`), capped at
+  500 entries, with Copy (clipboard) and Clear buttons.
+- **Ad-blocker hard block** (`sidepanel/sidepanel.{html,js,css}`): added a
+  hidden bait element (`#ad-bait`, classic ad-related class names like
+  `ad-banner`/`adsbygoogle`) sitting in the side panel's own DOM — ad
+  blockers apply their element-hiding filter lists to any page they run on,
+  including extension pages, so no network request or extra permission is
+  needed. `isAdBlockerActive()` checks whether a filter list collapsed its
+  explicit 1px height. `showBlockingOverlay()` (previously hardcoded to the
+  "not on chat.qwen.ai" text) now takes an optional title/action-label/
+  action-handler, reused for the new "Ad blocker detected" case with a
+  "Re-check now" button instead of a "Navigate to chat.qwen.ai" one. The
+  old `checkQwenTab()` poll is now `checkBlockingState()`: same `if
+  (running) return;` idle-only guard, but checks the ad blocker first and
+  short-circuits before the chat.qwen.ai PING check if one's detected.
+- **Not independently tested live** — same tooling constraint as most of
+  this changelog's history: this session's browser automation can't load
+  an unpacked MV3 extension (`chrome://extensions` is blocked from
+  automation). Verified statically (`node --check` on both changed JS
+  files, manual re-read of the HTML/CSS for tag/selector consistency).
+  Next real-world test should confirm: the Log tab streams `qvfLog()` steps
+  live during a running queue and Copy/Clear both work; and that enabling
+  a real ad blocker (e.g. uBlock Origin) shows the new overlay within one
+  3s poll tick, "Re-check now" clears it immediately once disabled, and an
+  already-running queue is untouched if a blocker gets enabled mid-batch.
+
 ## 2026-07-19 — Planned (not yet implemented): an in-panel Log tab, and blocking use while an ad blocker is active
 
 - **Request**: the user confirmed today's rate-limit fix (previous entry)

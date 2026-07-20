@@ -451,6 +451,60 @@ button.primary:hover:not(:disabled) {
 	white-space: normal;
 }
 
+.log-panel {
+	border-bottom: none;
+}
+
+.log-actions {
+	display: flex;
+	gap: 12px;
+}
+
+.log-actions .link-button {
+	display: inline;
+	margin-top: 0;
+}
+
+.log-panel > .hint {
+	margin: -4px 0 10px;
+}
+
+#log-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: calc(100vh - 220px);
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	background: var(--panel);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	padding: 8px 10px;
+}
+
+#log-list li {
+	font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+	font-size: 11px;
+	line-height: 1.6;
+	color: var(--text-dim);
+	word-break: break-word;
+	white-space: pre-wrap;
+}
+
+#log-list li .log-ts {
+	color: var(--accent);
+	margin-right: 6px;
+}
+
+#log-list:empty::before {
+	content: "No log entries yet — start a queue to see step-by-step activity here.";
+	color: var(--text-dim);
+	font-size: 11px;
+	font-family: inherit;
+}
+
 .status-dot {
 	width: 7px;
 	height: 7px;

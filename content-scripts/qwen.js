@@ -38,6 +38,54 @@ window.addEventListener("unhandledrejection", (e) =>
 	qvfLog(`window unhandledrejection: ${(e.reason && e.reason.message) || e.reason}`),
 );
 
+// Ad-blocker detection: attempt requests to real ad-serving URLs known to
+// get network-blocked by content blockers. A cosmetic DOM-bait element
+// (classic "ad-banner"/"adsbygoogle" class names, checked for a collapsed
+// height) was tried first and confirmed live, via direct DevTools
+// inspection with AdGuard enabled, to NOT get hidden — modern ad blockers
+// increasingly leave well-known honeypot elements alone specifically to
+// defeat anti-adblock detection scripts. A single network-bait URL
+// (pagead2.googlesyndication.com/pagead/js/adsbygoogle.js) was tried next
+// and also confirmed live not to trip, even with AdGuard actively blocking
+// other trackers on the same page (an Alibaba tracking script) — that
+// specific Google script is apparently allowlisted by AdGuard's filter set
+// even though it blocks plenty else. Two independent, well-established
+// bait URLs are used now instead of one, so one blocker's specific filter
+// quirks can't silently defeat this again:
+//   - static.doubleclick.net/instream/ad_status.js — the de facto standard
+//     ad-blocker-detection resource used across the industry (the same URL
+//     libraries like just-detect-adblock rely on), blocked by essentially
+//     every major filter list (EasyList, AdGuard Base, etc.) specifically
+//     because publishers already lean on it for exactly this purpose.
+//   - pagead2.googlesyndication.com/pagead/js/adsbygoogle.js — kept as a
+//     second, independent signal; not blocked by this user's AdGuard setup,
+//     but may be by others.
+// Any one of them failing counts as a blocker being active.
+//
+// mode: "no-cors" means each request always resolves (an opaque response)
+// if it's allowed through — no CORS headers required, same as any tracking
+// pixel — so a thrown/rejected fetch can only mean something intercepted
+// the request before it reached the network, i.e. a blocker. Checked once
+// immediately and re-checked periodically (not on every PING, to avoid a
+// network round-trip on every 3s panel poll); PING reads whatever this last
+// resolved to.
+const AD_BLOCKER_TEST_URLS = [
+	"https://static.doubleclick.net/instream/ad_status.js",
+	"https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js",
+];
+
+let adBlockerActive = false;
+
+async function refreshAdBlockerStatus() {
+	const results = await Promise.allSettled(
+		AD_BLOCKER_TEST_URLS.map((url) => fetch(url, { mode: "no-cors", cache: "no-store" })),
+	);
+	adBlockerActive = results.some((r) => r.status === "rejected");
+}
+
+refreshAdBlockerStatus();
+setInterval(refreshAdBlockerStatus, 20000);
+
 /**
  * Find the prompt composer on the page. Confirmed live: a plain <textarea
  * class="message-input-textarea ...">, no framework-controlled rich-text
@@ -466,9 +514,30 @@ function sleep(ms) {
  * panel alone which step it actually got stuck on. Open DevTools on the
  * chat.qwen.ai tab (F12 → Console) before clicking Start Queue to capture
  * this next time it happens.
+ *
+ * Also broadcast to the side panel's Log tab, same pattern as
+ * background.js's QWEN_FOCUS_CHANGED broadcast — the panel isn't always
+ * open to receive it, so a missing-listener rejection is expected and
+ * swallowed rather than surfaced.
+ *
+ * Wrapped in try/catch, not just a promise .catch(): if this content script
+ * instance is a stale one left over from before the extension was
+ * reloaded/updated (page never refreshed), chrome.runtime.sendMessage()
+ * throws "Extension context invalidated" synchronously, before it ever
+ * returns a promise — a .catch() alone doesn't run in time to swallow that.
+ * This is a routine dev-reload situation (an already-open chat.qwen.ai tab
+ * outliving an extension reload), not a real bug in the running batch, so
+ * it's silently swallowed the same as a missing panel listener.
  */
 function qvfLog(step) {
 	console.log(`[QVF ${new Date().toISOString()}] ${step}`);
+	try {
+		chrome.runtime
+			.sendMessage({ target: "panel", type: "QVF_LOG", payload: { step, ts: Date.now() } })
+			.catch(() => {});
+	} catch (err) {
+		void err;
+	}
 }
 
 /**
@@ -561,8 +630,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 			toolbarReady: !!document.querySelector('[aria-label="Select Mode"]'),
 			loginFormReady: isLoginFormPresent(),
 			dailyLimitReached: !!findDailyLimitMessage(),
+			adBlockerActive,
 		});
 		return;
+	}
+
+	if (message.type === "REFRESH_AD_BLOCKER") {
+		// On-demand recheck for the panel's "Re-check now" button — PING alone
+		// only reads the cached adBlockerActive value (refreshed every 20s by
+		// refreshAdBlockerStatus() above), which would otherwise leave the
+		// button waiting up to 20s to reflect a blocker the user just disabled.
+		refreshAdBlockerStatus().then(() => sendResponse({ ok: true, adBlockerActive }));
+		return true; // async response
 	}
 
 	if (message.type === "RUN_PROMPT") {

@@ -30,6 +30,10 @@ const blockingActionEl = document.getElementById("blocking-action");
 const tabButtons = document.querySelectorAll(".tab-button");
 const controlsViewEl = document.getElementById("controls-view");
 const aboutViewEl = document.getElementById("about-view");
+const logViewEl = document.getElementById("log-view");
+const logListEl = document.getElementById("log-list");
+const copyLogBtn = document.getElementById("copy-log");
+const clearLogBtn = document.getElementById("clear-log");
 const aboutVersionEl = document.getElementById("about-version");
 const aboutWebsiteLinkEl = document.getElementById("about-website-link");
 const downloadLocationNoticeEl = document.getElementById("download-location-notice");
@@ -56,6 +60,13 @@ let switchAttempts = 0; // bounds total account switches to accounts.length
 // Pause/Resume button's own state. The wait loops in delayWithCountdown()
 // and runQueue() block on either flag.
 let focusPaused = false;
+
+// Content-script qvfLog() steps, mirrored here via the QVF_LOG broadcast
+// (see the onMessage listener below). In memory only, same convention as
+// the queue/accounts above — cleared on panel close, capped so a long
+// batch can't grow it unbounded.
+let logEntries = []; // [{ step, ts }]
+const MAX_LOG_ENTRIES = 500;
 
 const SETTINGS_KEY = "qwen_video_factory_settings";
 const DOWNLOAD_NOTICE_KEY = "qwen_video_factory_download_notice_dismissed";
@@ -321,12 +332,12 @@ openDownloadSettingsBtn.addEventListener("click", () => {
 	chrome.tabs.create({ url: "chrome://settings/downloads" });
 });
 
+const tabViews = { controls: controlsViewEl, about: aboutViewEl, log: logViewEl };
+
 tabButtons.forEach((button) => {
 	button.addEventListener("click", () => {
 		tabButtons.forEach((b) => b.classList.toggle("active", b === button));
-		const showAbout = button.dataset.tab === "about";
-		controlsViewEl.hidden = showAbout;
-		aboutViewEl.hidden = !showAbout;
+		for (const [name, el] of Object.entries(tabViews)) el.hidden = name !== button.dataset.tab;
 	});
 });
 
@@ -478,14 +489,18 @@ function buildExhaustionSummary(submittedCount, total) {
 
 /**
  * Full-panel modal that blocks every control underneath it — not just a
- * status message — for the one state where automation genuinely cannot
- * proceed: not on chat.qwen.ai at all.
+ * status message — for states where automation genuinely cannot proceed:
+ * not on chat.qwen.ai, or an ad blocker is active on that page (see
+ * checkBlockingState() below). `options.title`/`actionLabel`/`onAction`
+ * default to the not-on-chat.qwen.ai case.
  */
-function showBlockingOverlay(message) {
-	blockingTitleEl.textContent = "Not on chat.qwen.ai";
+function showBlockingOverlay(message, options = {}) {
+	blockingTitleEl.textContent = options.title || "Not on chat.qwen.ai";
 	blockingMessageEl.textContent =
 		message || "Qwen Video Factory only works when you're on chat.qwen.ai.";
-	blockingActionEl.onclick = () => chrome.tabs.create({ url: QWEN_TOOL_URL });
+	blockingActionEl.textContent = options.actionLabel || "Navigate to chat.qwen.ai";
+	blockingActionEl.onclick =
+		options.onAction || (() => chrome.tabs.create({ url: QWEN_TOOL_URL }));
 	blockingOverlayEl.hidden = false;
 }
 
@@ -493,19 +508,56 @@ function hideBlockingOverlay() {
 	blockingOverlayEl.hidden = true;
 }
 
+function showAdBlockerOverlay() {
+	showBlockingOverlay(
+		"An ad blocker was detected. Disable it for this site, then re-check.",
+		{
+			title: "Ad blocker detected",
+			actionLabel: "Re-check now",
+			onAction: () => checkBlockingState({ forceAdBlockerRefresh: true }),
+		},
+	);
+}
+
 /**
- * Poll for a live, ready chat.qwen.ai tab so the status bar (and the
- * blocking overlay) reflect reality instead of a static placeholder. Skipped
- * while a queue is running so it doesn't clobber the in-progress status
- * text — the overlay would otherwise physically prevent the running queue's
- * own Pause/Stop controls from being clicked.
+ * Poll for a live, ready chat.qwen.ai tab — and for an active ad blocker on
+ * that same page — so the status bar (and the blocking overlay) reflect
+ * reality instead of a static placeholder. Skipped while a queue is running
+ * so it doesn't clobber the in-progress status text — the overlay would
+ * otherwise physically prevent the running queue's own Pause/Stop controls
+ * from being clicked. This is deliberately an idle-time gate only: it stops
+ * a new batch from starting, but never interrupts one already running.
+ *
+ * The ad-blocker signal comes from the content script's PING response
+ * (`adBlockerActive`, computed in content-scripts/qwen.js) rather than
+ * anything checked here. Two earlier approaches didn't pan out: a bait
+ * element in this side panel's own chrome-extension:// page never got seen
+ * by a real ad blocker at all (Chrome doesn't let one extension's content
+ * scripts run inside another extension's UI pages); a cosmetic bait element
+ * moved onto chat.qwen.ai's own page was confirmed live, via DevTools with
+ * AdGuard enabled, to not get hidden either — modern blockers increasingly
+ * leave well-known honeypot elements alone to defeat anti-adblock scripts.
+ * The content script now checks via an actual network request instead (see
+ * its refreshAdBlockerStatus()), which blockers can't suppress without also
+ * not blocking ads. That check only runs every 20s on its own, so PING
+ * alone would leave the "Re-check now" button waiting up to 20s to reflect
+ * a blocker the user just disabled — `forceAdBlockerRefresh` sends a
+ * REFRESH_AD_BLOCKER message first to force an immediate on-demand check.
  */
-async function checkQwenTab() {
+async function checkBlockingState({ forceAdBlockerRefresh = false } = {}) {
 	if (running) return;
+
+	if (forceAdBlockerRefresh) await sendToContent("REFRESH_AD_BLOCKER");
+
 	const ping = await sendToContent("PING");
 	if (!ping.ok) {
 		setStatus(ping.error || "No chat.qwen.ai tab found.", "error");
 		showBlockingOverlay(ping.error);
+		return;
+	}
+	if (ping.adBlockerActive) {
+		setStatus("Ad blocker detected on chat.qwen.ai — disable it to continue.", "error");
+		showAdBlockerOverlay();
 		return;
 	}
 	setStatus("chat.qwen.ai detected — ready to start.", "idle");
@@ -514,12 +566,12 @@ async function checkQwenTab() {
 
 // Best-effort refresh once when the panel first opens, so automation always
 // starts from a clean page load rather than a tab that's been sitting open
-// accumulating state. Silent on failure — checkQwenTab()'s own polling
-// (below) already surfaces that clearly via the blocking overlay.
+// accumulating state. Silent on failure — checkBlockingState()'s own
+// polling (below) already surfaces that clearly via the blocking overlay.
 refreshQwenTab();
 
-checkQwenTab();
-setInterval(checkQwenTab, 3000);
+checkBlockingState();
+setInterval(checkBlockingState, 3000);
 
 /**
  * Wait the configured (randomized) delay before the next prompt, ticking the
@@ -838,6 +890,42 @@ chrome.runtime.onMessage.addListener((message) => {
 	} else if (!focusPaused && wasFocusPaused && !paused) {
 		setStatus("chat.qwen.ai tab focused again — resuming...", "running");
 	}
+});
+
+/**
+ * Append one qvfLog() step (broadcast from content-scripts/qwen.js) to the
+ * Log tab. Kept purely additive/in-memory — see logEntries above.
+ */
+function appendLogEntry(step, ts) {
+	logEntries.push({ step, ts });
+	if (logEntries.length > MAX_LOG_ENTRIES) logEntries.shift();
+
+	const li = document.createElement("li");
+	const time = document.createElement("span");
+	time.className = "log-ts";
+	time.textContent = new Date(ts).toLocaleTimeString();
+	li.appendChild(time);
+	li.appendChild(document.createTextNode(step));
+	logListEl.appendChild(li);
+	while (logListEl.children.length > MAX_LOG_ENTRIES) logListEl.removeChild(logListEl.firstChild);
+	logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+	if (message.target !== "panel" || message.type !== "QVF_LOG") return;
+	appendLogEntry(message.payload.step, message.payload.ts);
+});
+
+clearLogBtn.addEventListener("click", () => {
+	logEntries = [];
+	logListEl.replaceChildren();
+});
+
+copyLogBtn.addEventListener("click", () => {
+	const text = logEntries
+		.map((e) => `[${new Date(e.ts).toISOString()}] ${e.step}`)
+		.join("\n");
+	navigator.clipboard.writeText(text).catch(() => {});
 });
 
 startBtn.addEventListener("click", () => {

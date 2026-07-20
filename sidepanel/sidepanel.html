@@ -22,6 +22,9 @@
 				<button type="button" class="tab-button" data-tab="about">
 					About
 				</button>
+				<button type="button" class="tab-button" data-tab="log">
+					Log
+				</button>
 			</nav>
 
 			<div id="controls-view">
@@ -134,6 +137,28 @@
 						<span id="queue-progress" class="hint">0 / 0</span>
 					</div>
 					<ul id="queue-list"></ul>
+				</section>
+			</div>
+
+			<div id="log-view" hidden>
+				<section class="panel log-panel">
+					<div class="queue-header">
+						<h2>Log</h2>
+						<div class="log-actions">
+							<button type="button" id="copy-log" class="link-button">
+								Copy
+							</button>
+							<button type="button" id="clear-log" class="link-button">
+								Clear
+							</button>
+						</div>
+					</div>
+					<p class="hint">
+						Step-by-step activity from the chat.qwen.ai tab — the
+						same output DevTools' console would show, useful for
+						bug reports.
+					</p>
+					<ul id="log-list"></ul>
 				</section>
 			</div>
 
