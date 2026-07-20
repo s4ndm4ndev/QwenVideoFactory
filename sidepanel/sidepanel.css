@@ -443,6 +443,15 @@ button.primary:hover:not(:disabled) {
 	text-overflow: ellipsis;
 }
 
+.item-thumb-img {
+	width: 18px;
+	height: 18px;
+	border-radius: 3px;
+	object-fit: cover;
+	border: 1px solid var(--border);
+	flex-shrink: 0;
+}
+
 #queue-list .item-error {
 	font-size: 11px;
 	color: var(--error);

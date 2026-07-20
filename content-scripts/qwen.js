@@ -528,26 +528,34 @@ function sleep(ms) {
 /**
  * Attach a reference image to the composer before submitting a prompt.
  *
- * BEST-GUESS SKELETON — NOT CONFIRMED LIVE. Unlike every other selector in
- * this file (each backed by an existing "Confirmed live: ..." comment from
- * real testing), whether chat.qwen.ai's "Create Video" composer even has a
- * reference/starting-image upload control at all is unverified. This mirrors
- * the shape of Overflow's attachCharacterImage() (this extension's sister
- * project, content-scripts/flow.js) — rebuild a File from the data URL,
- * drive a file input via a synthetic DataTransfer + change event, then wait
- * for some on-page confirmation the image was accepted — but every selector
- * below is a guess to be corrected once tested against the live site:
- *   - the file input's location/selector (guessed: somewhere near the
- *     [aria-label="Select Mode"] toolbar, possibly hidden behind an icon
- *     button that must be clicked first to reveal it)
- *   - the "image attached" confirmation signal waitFor() polls for (guessed:
- *     a thumbnail/chip rendered near the composer)
- *   - whether a synthetic DataTransfer + change/input event is even enough,
- *     or whether (like Overflow's Flow target) chat.qwen.ai requires a
- *     trusted click via chrome.debugger instead — if live testing shows
- *     synthetic events don't register, that's a real scope add (this
- *     extension currently has no "debugger" permission or DEBUGGER_* handlers,
- *     unlike Overflow's background.js)
+ * CONFIRMED LIVE (2026-07-20, via direct DOM investigation against the real
+ * site with a real logged-in session). The root cause of the first two live
+ * test failures: chat.qwen.ai's #filesUpload file input only actually
+ * registers a synthetic file selection if the real "Upload attachment" menu
+ * item was clicked first — dispatching a DataTransfer/change event straight
+ * at a cold #filesUpload (this function's original approach) silently does
+ * nothing, no matter whether "Create Video" mode is already selected.
+ * Clicking the menu item first (exactly as below) reliably fixes it,
+ * confirmed live and repeatably, independent of video-mode state.
+ *
+ * Also confirmed live: item.click() here (an untrusted, script-triggered
+ * click) does NOT open a real native OS file-picker dialog — Chrome only
+ * allows a file input's picker to open from a trusted user gesture, so this
+ * safely primes whatever internal upload state chat.qwen.ai's React app
+ * needs without ever risking a stuck native dialog. No trusted keypress
+ * (e.g. Escape) is needed either — confirmed the flow below works using only
+ * actions this content script can actually perform.
+ *
+ * Selectors: [aria-label="Select Mode"] is the same mode-select trigger
+ * enableVideoMode() already uses; the "Upload attachment" entry is a
+ * li.mode-select-common-item, same class enableVideoMode() already matches
+ * "Create Video" against. #filesUpload is confirmed as the composer's own
+ * upload control (aria-label="Upload files", inside .mode-select, accept
+ * list includes image/png, image/jpeg, etc. among many other file types).
+ * The uploaded image's preview renders as <img class="vision-item-image">
+ * (56x56, src on chat.qwen.ai's own OSS CDN — a real network upload, not an
+ * instant local blob preview, hence the generous wait below) — confirmed via
+ * direct inspection, not guessed.
  *
  * Tagged PAGE_NOT_READY: on failure, same as enableVideoMode()'s failure
  * points — nothing has been submitted yet at this point, so runQueue()'s
@@ -557,10 +565,40 @@ async function attachReferenceImage(dataUrl, fileName, mimeType) {
 	const blob = await fetch(dataUrl).then((r) => r.blob());
 	const file = new File([blob], fileName, { type: mimeType || blob.type });
 
-	// UNCONFIRMED selector — placeholder guess, needs live verification.
-	const input = document.querySelector('input[type="file"]');
+	const trigger = document.querySelector('[aria-label="Select Mode"]');
+	if (!trigger)
+		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger to open the upload menu.");
+	trigger.click();
+
+	// Small human-paced delay before picking the menu item, same rationale as
+	// enableVideoMode()'s identical pause.
+	await sleep(250 + Math.random() * 400);
+
+	const uploadItem = await waitFor(
+		() =>
+			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
+				li.textContent.includes("Upload attachment"),
+			),
+		5000,
+		200,
+	);
+	if (!uploadItem)
+		throw new Error("PAGE_NOT_READY: Could not find the 'Upload attachment' option in the mode menu.");
+	uploadItem.click();
+
+	await sleep(250 + Math.random() * 400);
+
+	const input = document.getElementById("filesUpload");
 	if (!input)
 		throw new Error("PAGE_NOT_READY: Could not find the reference-image upload control on the page.");
+
+	// Snapshot existing preview thumbnails before uploading, so the
+	// confirmation check below recognizes a genuinely NEW one appearing —
+	// same "new, not pre-existing" principle waitForResult() above already
+	// uses (via its own alreadyPresent Set) to detect a finished video.
+	const alreadyPresentImgSrcs = new Set(
+		Array.from(document.querySelectorAll("img.vision-item-image")).map((img) => img.src),
+	);
 
 	const dataTransfer = new DataTransfer();
 	dataTransfer.items.add(file);
@@ -568,16 +606,23 @@ async function attachReferenceImage(dataUrl, fileName, mimeType) {
 	input.dispatchEvent(new Event("change", { bubbles: true }));
 	input.dispatchEvent(new Event("input", { bubbles: true }));
 
-	// UNCONFIRMED confirmation signal — placeholder guess, needs live
-	// verification (e.g. a thumbnail/chip that appears near the composer once
-	// chat.qwen.ai has actually accepted the upload).
-	const attached = await waitFor(
-		() => document.querySelector('[class*="image-upload"] img, [class*="attachment"] img'),
+	// Generous timeout: confirmed live this is a real upload to chat.qwen.ai's
+	// own CDN, not an instant local preview.
+	const newImg = await waitFor(
+		() =>
+			Array.from(document.querySelectorAll("img.vision-item-image")).find(
+				(img) => img.src && !alreadyPresentImgSrcs.has(img.src),
+			),
 		20000,
 		300,
 	);
-	if (!attached)
+	if (!newImg) {
+		qvfLog(
+			"attachReferenceImage: no new img.vision-item-image appeared after uploading — the upload likely failed or is taking longer than 20s",
+		);
 		throw new Error("PAGE_NOT_READY: Could not confirm the reference image was attached.");
+	}
+	qvfLog(`attachReferenceImage: confirmed attached, src starts: ${newImg.src.slice(0, 60)}`);
 }
 
 /**

@@ -15,6 +15,199 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-20 — Found and fixed the real cause of the reference-image attach failure, via direct live DOM investigation
+
+- **Request**: the previous entry's fix (confirmed file-input selector, new
+  "new &lt;img&gt; appeared" detection) still failed identically in the
+  user's next test — same Log tab message, no new image ever detected. The
+  user offered to log into a real account so this could be investigated
+  directly instead of guessing a third time, and this session used Claude in
+  Chrome (the user's own real Chrome, with their existing logged-in
+  chat.qwen.ai session — no credentials were entered by the assistant at any
+  point) to inspect the live composer.
+- **Investigated live, methodically**: opened the "+" tools menu and found
+  "Create Video" and "Upload attachment" (subtext "file, image" once a mode
+  is selected) are two separate, independent menu entries — not "an upload
+  option that only appears once you're in video mode." Selecting "Create
+  Video" first, then manually driving `#filesUpload` via the exact same
+  DataTransfer/change-event technique `attachReferenceImage()` uses,
+  produced a real `<img class="vision-item-image">` (56×56, `src` on
+  chat.qwen.ai's own OSS CDN — a genuine network upload, not an instant
+  local preview) within a few seconds. Re-running the identical dispatch
+  moments later — same page, same mode, a freshly-generated unique image —
+  produced **nothing**. Isolated the actual variable through repeated
+  A/B tests: the very first successful attempt happened to be preceded by a
+  real UI click on the "Upload attachment" menu item (before Escape-ing out
+  of what turned out to be a picker that Chrome silently refused to open for
+  an untrusted click); every subsequent cold dispatch — with or without
+  "Create Video" mode selected — failed until that same menu-item click was
+  repeated first. Confirmed this is genuinely the load-bearing step (not
+  video-mode state, not file-content deduplication — tested and ruled both
+  out directly) via a final clean test using only actions a content script
+  can actually perform: `element.click()` (untrusted, script-triggered —
+  confirmed this does **not** open a real native file-picker dialog; Chrome
+  restricts that specifically to trusted user gestures, so this is safe to
+  automate) and `setTimeout`-based delays, no trusted keypress involved.
+- **Root cause**: chat.qwen.ai's `#filesUpload` input only actually
+  registers a synthetic file selection if the real "Upload attachment" menu
+  item (`li.mode-select-common-item`, same class `enableVideoMode()` already
+  matches "Create Video" against) was clicked first — dispatching straight
+  at a cold input, this function's approach in both previous entries, is
+  silently ignored by chat.qwen.ai's React app regardless of video-mode
+  state or file content.
+- **`content-scripts/qwen.js`**: `attachReferenceImage()` now clicks
+  `[aria-label="Select Mode"]` (the existing, already-confirmed mode-select
+  trigger) to open the menu, waits, clicks the "Upload attachment" item,
+  waits again, then does the same DataTransfer/change dispatch as before.
+  Tightened the confirmation check from "any new `<img>` anywhere on the
+  page" to `img.vision-item-image` specifically, now that the real class is
+  known — more precise, less prone to a false-positive match from some
+  unrelated dynamic content elsewhere on the page.
+- **Confirmed live end-to-end, repeatably** — unlike every entry above it
+  today, this one was validated directly against the real site through
+  several independent test runs (with video mode, without it, with and
+  without the trigger click, with unique vs. repeated file content) before
+  being written into the extension, not reasoned through blind. Next
+  real-world test through the actual extension should confirm this now
+  succeeds in the queue itself, not just in an ad hoc console test.
+
+## 2026-07-20 — Confirmed the reference-image file input live; replaced the guessed confirmation selector with a proven detection pattern
+
+- **Request**: the user shared the Log tab / DevTools console output from the
+  previous entry's diagnostic logging.
+- **Good news buried in the failure**: the log line
+  `attachReferenceImage: found 1 input[type="file"] on the page: [0] <input
+  type="file" id="filesUpload" multiple="" style="display:none"
+  aria-label="Upload files" tabindex="-1"> (parent: <div
+  class="mode-select">...)` confirms the file-input guess was actually
+  right — a single file input on the whole page, `aria-label="Upload
+  files"`, sitting inside `.mode-select`, i.e. genuinely the composer's own
+  upload control. The only thing that failed was the confirmation check
+  immediately after — a guessed CSS class selector
+  (`[class*="image-upload"] img, [class*="attachment"] img`) that never
+  matched anything.
+- **`content-scripts/qwen.js`**: `attachReferenceImage()` now targets
+  `document.getElementById("filesUpload")` directly (confirmed selector,
+  falling back to the diagnostic scan's first result). Replaced the guessed
+  confirmation class with the same "new, not pre-existing" detection
+  `waitForResult()` already uses successfully for finding a finished video
+  (via its `alreadyPresent` Set) — snapshot every `<img src>` on the page
+  before dispatching the synthetic `DataTransfer`/`change` event, then poll
+  for any `<img>` whose `src` wasn't in that snapshot. A real, evidence-based
+  improvement over guessing a fourth class name blind, though still not
+  independently confirmed to work — whether the synthetic event even
+  registers with chat.qwen.ai's framework at all is still open (the first
+  test got past this point without an *input-not-found* error, but never
+  proved the upload itself succeeded either).
+- **`sidepanel/sidepanel.js`**: also added, per the user's separate request,
+  a thumbnail preview in the queue list itself
+  (`.item-thumb-img`, mirroring Overflow's own `#queue-list
+  .item-thumbs`/`.item-thumb-img` pattern) — `renderQueue()` now shows each
+  item's paired reference image (if any) directly next to its prompt text,
+  so image-to-prompt pairing can be visually double-checked before a batch
+  starts, independent of whatever ends up fixing the attach step itself.
+- **Not independently tested live** — the file-input selector is confirmed
+  from the user's own console output, but the new confirmation logic hasn't
+  been. Next real-world test: run a batch with reference images enabled and
+  check the Log tab for either `attachReferenceImage: confirmed via new
+  image element: ...` (success — and worth sanity-checking that the logged
+  `<img>` really is the uploaded file's own preview, not some coincidental
+  unrelated image that loaded in the same window) or the new "no new
+  &lt;img&gt; appeared" message (still failing — the next diagnostic step
+  from there would be checking whether the upload registered with the
+  framework at all, e.g. via the Network tab for an upload request, rather
+  than guessing what kind of element the preview renders as).
+
+## 2026-07-20 — Reference-image attach still unconfirmed; added a queue-preview thumbnail and richer diagnostics instead of guessing a third selector blind
+
+- **Request**: the user tested the reference-images feature live (screenshot:
+  6 images uploaded and numbered correctly, queue built) — item 1 failed
+  with "Could not confirm the reference image was attached." (the
+  `PAGE_NOT_READY:`-tagged error from `attachReferenceImage()`'s
+  confirmation `waitFor()`, exhausted after 2 auto-retries). Asked for two
+  things: fix the error, and let the user visually confirm image-to-prompt
+  pairing in the queue before starting a batch.
+- **Queue-preview thumbnail (done, no live testing needed)**:
+  `sidepanel/sidepanel.js`'s `renderQueue()` now renders a small
+  `.item-thumb-img` next to any queue item that has a paired
+  `referenceImage` (same CSS/markup pattern as Overflow's own
+  `#queue-list .item-thumbs`/`.item-thumb-img`, adapted for a single image
+  per item instead of an array) — reflects the exact pairing that will
+  actually be sent to the content script, since it reads `item.referenceImage`
+  directly rather than recomputing anything.
+- **The attach error itself is not actually fixed** — it can't be, blind.
+  `attachReferenceImage()`'s file-input selector
+  (`document.querySelector('input[type="file"]')`, unscoped, grabs the
+  *first* file input anywhere on the page) was always flagged UNCONFIRMED;
+  the live failure is the first real evidence it's wrong, but not enough to
+  know *how* — chat.qwen.ai may have an unrelated file input elsewhere in
+  the DOM (profile picture upload, etc.) that this blindly grabbed instead
+  of a real composer image-attach control, or the composer may have no such
+  control at all. Guessing a fourth selector without new information has
+  low odds, per this project's own established pattern (see the many
+  earlier entries where guessing without live evidence took several rounds
+  to converge, or didn't).
+- **`content-scripts/qwen.js`**: `attachReferenceImage()` now logs (via the
+  existing `qvfLog()`/Log-tab mechanism) every `input[type="file"]` found on
+  the page — up to 5, with each one's truncated `outerHTML` and its parent
+  element's — before picking the first one, and logs explicitly if the
+  confirmation-signal wait times out. Turns the next live test into a
+  diagnostic that identifies the real control (or confirms none exists)
+  directly from the Log tab, no DevTools needed.
+- **Next step needs the user's help**: run a batch with reference images
+  enabled again, then check the Log tab (or Copy it) for the new
+  `attachReferenceImage: found N input[type="file"]...` line — that answers
+  whether a real candidate exists and what it looks like. Separately, it'd
+  help to know whether chat.qwen.ai's "Create Video" composer visibly offers
+  *any* way to attach a starting/reference image at all (an icon near the
+  "+"/mode-select area, etc.) — if it doesn't, this feature may need a
+  different approach entirely, not just a selector fix.
+
+## 2026-07-20 — Fixed the login-on-load overlay getting stuck over an actually-running queue
+
+- **Request**: the user tested the previous entry's login-on-load feature
+  live. Login itself worked and the queue auto-started (item 1 visibly at
+  4%, queue list populated behind it) — but a "Not on chat.qwen.ai" /
+  "CONNECTION_LOST: Could not establish connection. Receiving end does not
+  exist." blocking overlay stayed stuck on top of it the whole time,
+  screenshot attached. Their own read: "it started the queue process before
+  the extension got a chance to detect the page."
+- **Root cause, confirmed from the screenshot's exact error text**: that
+  message/title combination only ever comes from `checkBlockingState()`'s
+  independent 3s poll calling `showBlockingOverlay(ping.error)` on a failed
+  PING. `onLoginConfirmed()`'s `loginAccount()` call has `background.js`
+  navigate the tab to `https://chat.qwen.ai/auth` and back — during that
+  window the content script is genuinely unreachable for a moment, a normal
+  part of the flow, but `checkBlockingState()`'s poll doesn't know that and
+  has no way to tell it apart from actually not being on chat.qwen.ai. If a
+  poll tick's PING lands during that exact window (a real race — the login
+  navigation and the 3s poll interval are entirely independent timers), it
+  sets the overlay. The queue then auto-starts moments later and sets
+  `running = true`, and `checkBlockingState()`'s very first line (`if
+  (running) return;`) means **every future tick — including the one that
+  would eventually call `hideBlockingOverlay()`** — now no-ops for the rest
+  of the batch. The overlay was never wrong at the instant it was shown; it
+  just had no way to ever un-show itself once the queue took over.
+- **`sidepanel/sidepanel.js`**: added a module-level `accountFlowInProgress`
+  flag, set for the duration of `onLoginConfirmed()`'s `loginAccount()` call
+  (`try`/`finally`, so it clears on both success and failure) and checked
+  alongside `running` in both `checkBlockingState()`'s and
+  `checkLoginState()`'s early-return guards — stops the racing poll tick
+  from ever firing during the login navigation in the first place, rather
+  than trying to clean up after it. As defense in depth (covers any other
+  timing edge this doesn't anticipate), `runQueue()` now also calls
+  `hideBlockingOverlay()` explicitly right after its own startup PING
+  succeeds — at that point connectivity has just been reconfirmed directly,
+  so any overlay still showing is definitely stale.
+- **Not independently re-tested live** — diagnosed with high confidence
+  directly from the screenshot's exact error text and this codebase's own
+  message-tagging conventions (the `CONNECTION_LOST:` prefix only originates
+  from one place, `background.js`'s content-script relay), not reasoned
+  through blind. Next real-world test: repeat the exact login-on-load →
+  auto-start sequence and confirm the overlay never appears (or, if a poll
+  tick still somehow races in, that it clears itself once the queue's own
+  first PING succeeds instead of staying stuck for the batch).
+
 ## 2026-07-20 — Built three new features: login-on-load prompt, reference images, and clearing them with the queue
 
 - **Request**: three features, planned together first (Plan mode, with a

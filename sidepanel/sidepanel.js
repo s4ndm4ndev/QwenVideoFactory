@@ -92,6 +92,20 @@ let referenceImages = []; // [{ dataUrl, fileName, mimeType }]
 // this once a login prompt has been shown or skipped for a given trigger.
 let loginCheckInFlight = false;
 
+// Set for the duration of onLoginConfirmed()'s background-driven navigation
+// (chat.qwen.ai gets navigated to /auth and back before `running` is ever
+// set true by the queue that follows). checkBlockingState()'s independent
+// 3s poll doesn't know that navigation is expected, and a tick landing mid-
+// navigation reads a transiently-unreachable content script as "not on
+// chat.qwen.ai," showing the blocking overlay — which then never gets
+// cleared once the queue's own auto-start flips `running` true right after,
+// since checkBlockingState() no-ops entirely while running. Confirmed live:
+// this is exactly what left the panel stuck showing a stale "Not on
+// chat.qwen.ai" / CONNECTION_LOST overlay on top of an actually-running
+// queue. checkBlockingState() also skips while this is true, closing the
+// race at its source.
+let accountFlowInProgress = false;
+
 const SETTINGS_KEY = "qwen_video_factory_settings";
 const DOWNLOAD_NOTICE_KEY = "qwen_video_factory_download_notice_dismissed";
 
@@ -174,6 +188,19 @@ function renderQueue() {
 		text.textContent = item.text;
 		row.appendChild(dot);
 		row.appendChild(text);
+
+		// Lets the user visually confirm image-to-prompt pairing before
+		// starting a batch — item.referenceImage is set at queue-build time
+		// (see buildQueueFromPrompts()) from referenceImages[i] when the
+		// toggle is on, so this reflects the exact pairing that will actually
+		// be sent to the content script.
+		if (item.referenceImage) {
+			const thumb = document.createElement("img");
+			thumb.className = "item-thumb-img";
+			thumb.src = item.referenceImage.dataUrl;
+			thumb.title = item.referenceImage.fileName;
+			row.appendChild(thumb);
+		}
 
 		const badge = document.createElement("span");
 		badge.className = `status-badge ${item.status}`;
@@ -726,7 +753,7 @@ function showAdBlockerOverlay() {
  * REFRESH_AD_BLOCKER message first to force an immediate on-demand check.
  */
 async function checkBlockingState({ forceAdBlockerRefresh = false } = {}) {
-	if (running) return;
+	if (running || accountFlowInProgress) return;
 
 	if (forceAdBlockerRefresh) await sendToContent("REFRESH_AD_BLOCKER");
 
@@ -756,7 +783,17 @@ async function onLoginConfirmed() {
 	confirmNoBtn.disabled = true;
 	confirmMessageEl.textContent = "Logging in...";
 
-	const result = await loginAccount(accounts[0]);
+	// See accountFlowInProgress's declaration comment — this blocks
+	// checkBlockingState()'s independent 3s poll from misreading the
+	// background-driven /auth navigation below as "not on chat.qwen.ai."
+	accountFlowInProgress = true;
+	let result;
+	try {
+		result = await loginAccount(accounts[0]);
+	} finally {
+		accountFlowInProgress = false;
+	}
+
 	if (!result.ok) {
 		hideConfirmModal();
 		setStatus(`Login failed: ${result.error}`, "error");
@@ -789,7 +826,7 @@ async function onLoginConfirmed() {
  * blocker (checkBlockingState()'s own polling already owns surfacing those).
  */
 async function checkLoginState() {
-	if (accounts.length === 0 || running || loginCheckInFlight) return;
+	if (accounts.length === 0 || running || loginCheckInFlight || accountFlowInProgress) return;
 	loginCheckInFlight = true;
 	try {
 		const ping = await sendToContent("PING");
@@ -904,6 +941,14 @@ async function runQueue() {
 		resetControls();
 		return;
 	}
+
+	// Defense in depth alongside accountFlowInProgress above: this PING just
+	// reconfirmed the content script is genuinely reachable, so any blocking
+	// overlay still showing at this point is stale (e.g. from a
+	// checkBlockingState() tick that landed mid-navigation before `running`
+	// was set, or any other transient timing race) — clear it now that a
+	// real, successful connection has just been made.
+	hideBlockingOverlay();
 
 	let submittedCount = 0;
 
