@@ -15,6 +15,134 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-21 — Made mode-select clicks self-healing instead of relying on a full page reload every time one silently didn't register
+
+- **Request**: the user ran a real batch with reference images (screenshot:
+  console showed `setPromptText done` → `attachReferenceImage starting`,
+  then a stall) and reported the underlying pattern clearly for the first
+  time: item 1 fails its first two attempts — both enabling "Create Video"
+  mode and attaching the reference image fail — and only succeeds on the
+  3rd attempt, after 2 automatic reload-and-retry cycles. Called out that
+  this looks broken to a user even though it does eventually self-heal, and
+  asked for it to be root-caused properly, offering live debugging.
+- **Confirmed the exact mechanics** (Explore-agent read of the current code,
+  no guessing): `runQueue()` in `sidepanel/sidepanel.js` does exactly ONE
+  full page reload at the very start of a batch, before item 1's first
+  attempt; every subsequent `PAGE_NOT_READY:` failure (any item) triggers up
+  to 2 more reload-and-retries through the identical mechanism — 3 total
+  attempts, matching the reported pattern exactly. Item 1's first attempt is
+  the only one in a normal run structurally guaranteed to start immediately
+  after a fresh reload, making it the most exposed to any post-reload
+  flakiness. The reload-readiness gate (`composerReady`/`toolbarReady`) only
+  checks that the textarea and mode-select trigger *exist* in the DOM, not
+  that they're actually interactive yet.
+- **The real root cause isn't new** — `enableVideoMode()`'s own header
+  comment already documented it from an earlier session: a click on an
+  element that demonstrably exists can silently fail to register (menu
+  doesn't open, or a selection doesn't confirm), previously correlated with
+  an intermittent React hydration crash never fully nailed down across
+  several prior sessions. Live-tested this again directly (Claude in Chrome,
+  the user's own real, already-logged-in chat.qwen.ai session, no
+  credentials entered): several fresh reloads all hydrated cleanly within
+  ~1-1.75s with working clicks — consistent with this being a real but
+  intermittent issue, not a constant timing gap, and it couldn't be forced
+  to reproduce on demand in a handful of tries.
+- **Decision**: rather than continue chasing the exact crash cause (already
+  resisted diagnosis across multiple sessions), fixed the thing that's
+  cheap to fix regardless of cause — made each individual attempt recover
+  from a silently-swallowed click within its own existing timeout budget,
+  instead of relying on an expensive whole-page-reload as the only recovery
+  path.
+- **`content-scripts/qwen.js`**: added `retryClickUntil()` (right after
+  `waitFor()`) — clicks a target, and if the expected DOM change hasn't
+  happened after ~3.5s and time remains in the same total timeout the caller
+  already had, re-queries the target (DOM may have re-rendered) and clicks
+  it again, repeating until success or timeout. Applied it to
+  `enableVideoMode()`'s two click-then-wait steps (trigger→menu-open,
+  item→mode-pill-confirm — the latter's target-getter also re-clicks the
+  trigger to reopen the dropdown if it auto-closed after an apparently-silent
+  selection) and `attachReferenceImage()`'s one click-then-wait step
+  (trigger→menu-open). Worst-case duration for each step is unchanged (still
+  ≤20000ms) — only how that time gets spent changes. Deliberately left
+  unchanged: `attachReferenceImage()`'s item-click→`#filesUpload` existence
+  check (never evidenced as a failure point) and its 90s upload-confirmation
+  wait (confirmed live, 2026-07-20, to be genuine upload duration — retrying
+  there would mean re-dispatching the file, a real risk of a duplicate
+  upload for no upside).
+- **Deferred, not done now**: hooking the existing (currently
+  diagnostic-only) `error`/`unhandledrejection` listeners to detect the
+  crash signature and short-circuit an in-flight wait faster. Correlating a
+  global error event to one specific in-flight wait safely needs either a
+  shared flag threaded through every wait site or a narrow message match, to
+  avoid false-failing an otherwise-fine slow-but-real wait — better scoped
+  after seeing real `retryClickUntil` reclick logs from a live run, which
+  will show whether this is even still needed.
+- **`sidepanel.js`/`background.js`**: untouched by design. The
+  `PAGE_NOT_READY:` reload-and-retry path stays exactly as-is, as defense in
+  depth for whatever `retryClickUntil` doesn't catch — this fix only reduces
+  how often that path gets exercised. New reclick activity is visible for
+  free through the existing `qvfLog()` → panel Log-tab pipeline.
+- **Verified this session**: `node --check` passed. Also sanity-checked
+  `retryClickUntil()` standalone against the real page (Claude in Chrome,
+  same live session) — it correctly found and clicked the mode-select
+  trigger and resolved on the very first click with no spam or errors on a
+  normal (working) page, confirming the happy path is sound.
+- **Confirmed live in the user's next real batch (6 items, reference images
+  enabled)**: items 1–5 all completed `DONE` with no `PAGE_NOT_READY`
+  reload-retries at all — a real improvement over the previous "2 retries
+  before success" pattern. Item 6 did trigger one reclick
+  (`attachReferenceImage: open menu` — "no change after 3500ms,
+  re-clicking"), and it resolved in place on the very next check rather than
+  falling through to a full reload — exactly the intended behavior. This
+  fix is confirmed working, not just plausible.
+
+## 2026-07-21 — Recognized a third limit message (Alibaba Cloud's own API rate limit) that previously left the queue stuck on "Generating" instead of rotating accounts
+
+- **Request**: in the same live batch run above, the user reported that
+  after one account hit its limit and rotation worked correctly, the next
+  account also hit some kind of limit — but this time the extension did
+  *not* rotate to a third, available account. It just sat on "Generating"
+  until it naturally timed out.
+- **Root cause, visible directly in the shared screenshot's console**: the
+  actual failure was `"Oops! There was an issue connecting to Qwen3.7-Plus.
+  Requests rate limit exceeded, please try again later. For details, see:
+  https://www.alibabacloud.com/help/en/model-studio/error-code#rate-limit"`
+  — a third, distinct message from both existing checks:
+  `findDailyLimitMessage()`'s "daily usage limit" banner (rotates accounts)
+  and `findRateLimitMessage()`'s "too many requests in a short period"
+  client-side throttle (cooldown-retries the same account). This new message
+  matched neither, so `waitForResult()` never recognized anything had
+  happened and ran blind to its full 180s timeout — exactly the reported
+  symptom, and exactly why no rotation was attempted.
+- **`content-scripts/qwen.js`**: added `countApiRateLimitOccurrences()` /
+  `findApiRateLimitMessage()`, matching on the doc-URL fragment
+  (`model-studio/error-code#rate-limit`) as the primary anchor plus the
+  message phrase as fallback — same "rising count, not just presence"
+  principle as the existing rate-limit check, since this bubble also stays
+  in the transcript afterward. `waitForResult()` now resolves
+  `{ apiRateLimited: true, message }` when this rises, checked alongside the
+  other two conditions.
+- **`sidepanel/sidepanel.js`**: new `apiRateLimited` branch in `runQueue()`.
+  Judgment call, not yet live-confirmed: unlike the existing "too many
+  requests" throttle (assumed browser/IP-wide, so rotating accounts wouldn't
+  help), this message is Alibaba's own backend API rate limit — plausibly
+  scoped to the specific account/API key, not shared — so this does a few
+  short cooldown-retries on the same account first (reusing
+  `rateLimitCooldown()`, now with an optional `label` param so the status
+  text reads "Hit Qwen's API rate limit" instead of reusing the other
+  throttle's wording), and if that doesn't clear it within 3 attempts,
+  rotates to the next account via the existing `tryRotateToNextAccount()` —
+  the same path the daily-limit case already uses — rather than stopping the
+  whole queue. This directly addresses the reported gap: an available next
+  account was never tried.
+- **Not yet independently tested live** — implemented directly from the
+  user's own real screenshot (strong evidence for the detection side), but
+  the retry-then-rotate behavior itself hasn't been exercised against a real
+  repeat of this condition yet. Next real-world test: if this message
+  recurs, confirm the Log tab / status line shows "Hit Qwen's API rate
+  limit" cooldowns first, then (if it persists past 3 attempts) an actual
+  rotation to the next available account — not another silent stall.
+
 ## 2026-07-20 — The new logging paid off immediately: found the "Upload attachment" menu item gets 4x less wait time than the equivalent "Create Video" check, for no real reason
 
 - **Request**: the user ran a batch and shared three screenshots from a real

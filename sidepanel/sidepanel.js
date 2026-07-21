@@ -890,7 +890,7 @@ async function delayWithCountdown() {
  * IP, etc.), and retrying too eagerly risks tripping the same limit again
  * immediately.
  */
-async function rateLimitCooldown(attempt) {
+async function rateLimitCooldown(attempt, label = "Rate limited by chat.qwen.ai") {
 	const totalSec = Math.min(45 + (attempt - 1) * 30 + Math.floor(Math.random() * 20), 240);
 
 	for (let remaining = totalSec; remaining > 0; remaining--) {
@@ -900,10 +900,7 @@ async function rateLimitCooldown(attempt) {
 			if (!running) break;
 		}
 		if (!running) break;
-		setStatus(
-			`Rate limited by chat.qwen.ai — cooling down, retrying in ${remaining}s (attempt ${attempt})...`,
-			"error",
-		);
+		setStatus(`${label} — cooling down, retrying in ${remaining}s (attempt ${attempt})...`, "error");
 		await sleep(1000);
 	}
 }
@@ -1092,6 +1089,48 @@ async function runQueue() {
 			queue[i].error = `Still rate-limited by chat.qwen.ai after ${attempts - 1} retries — stopping rather than keep hammering it: ${result.message}`;
 			renderQueue();
 			setStatus(queue[i].error, "error");
+			break;
+		}
+
+		// Confirmed live via a user screenshot: a third, distinct message
+		// ("Requests rate limit exceeded... model-studio/error-code#rate-limit")
+		// from Alibaba Cloud Model Studio's own backend API — before this was
+		// recognized (see countApiRateLimitOccurrences() in qwen.js), it matched
+		// neither the daily-limit nor the rateLimited check above, so it fell
+		// through to waitForResult()'s blind 180s timeout with no cooldown and
+		// no rotation, exactly matching the reported symptom: an account hits
+		// this and the queue just sits on "Generating" until it naturally times
+		// out, never trying the next available account. Unlike the
+		// browser/IP-wide "too many requests" throttle above (where rotating
+		// accounts wouldn't help, since every account would hit the same wall),
+		// this is Alibaba's own per-account/API-key rate limit — plausibly tied
+		// to this specific account's quota, not a shared one. So: a few short
+		// cooldown-retries on the same account first (it may just be a brief
+		// burst), and if that doesn't clear it, rotate to the next account
+		// (reusing tryRotateToNextAccount(), the same daily-limit rotation path)
+		// rather than stopping the whole queue.
+		if (result.ok && result.apiRateLimited) {
+			const attempts = (queue[i].apiRateLimitRetries || 0) + 1;
+			queue[i].apiRateLimitRetries = attempts;
+			if (attempts <= 3) {
+				queue[i].status = "pending";
+				queue[i].error = null;
+				renderQueue();
+				await rateLimitCooldown(attempts, "Hit Qwen's API rate limit");
+				if (!running) break;
+				continue; // don't advance i
+			}
+			const switched = await tryRotateToNextAccount(submittedCount);
+			if (switched.ok) {
+				queue[i].status = "pending"; // never actually accepted — retry it on the new account
+				queue[i].apiRateLimitRetries = 0; // fresh account, fresh budget
+				renderQueue();
+				continue; // don't advance i
+			}
+			queue[i].status = "limit";
+			queue[i].error = switched.finalMessage;
+			renderQueue();
+			setStatus(switched.finalMessage, "error");
 			break;
 		}
 

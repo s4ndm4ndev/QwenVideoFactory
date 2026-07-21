@@ -203,32 +203,46 @@ async function enableVideoMode() {
 		qvfLog("enableVideoMode: mode-select trigger not found after waiting 20s");
 		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger on the page.");
 	}
-	trigger.click();
 
-	// Small human-paced delay before picking the menu item, as if someone
-	// actually looked at the dropdown before clicking, rather than clicking
-	// the instant it opens.
-	await sleep(250 + Math.random() * 400);
-
-	const item = await waitFor(
+	// Both steps below use retryClickUntil() instead of a single blind click
+	// + passive wait: per the comment above, a click on an element that
+	// demonstrably exists can silently fail to register (page not actually
+	// interactive yet, e.g. mid-hydration), and re-clicking within the same
+	// 20s budget recovers from that far more cheaply than failing the whole
+	// attempt and forcing sidepanel.js to reload the entire page.
+	const item = await retryClickUntil(
+		() => document.querySelector('[aria-label="Select Mode"]'),
 		() =>
 			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
 				li.textContent.includes("Create Video"),
 			),
 		20000,
-		200,
+		{ initialDelayMs: 250 + Math.random() * 400, label: "enableVideoMode: open menu" },
 	);
 	if (!item) {
-		qvfLog("enableVideoMode: 'Create Video' option not found in the mode menu after waiting 20s");
+		qvfLog("enableVideoMode: 'Create Video' option not found after retry-clicking the trigger for 20s");
 		throw new Error(
 			"PAGE_NOT_READY: Could not find the 'Create Video' option in the mode menu.",
 		);
 	}
-	item.click();
 
-	const enabled = await waitFor(isVideoModeOn, 20000, 200);
+	const enabled = await retryClickUntil(
+		() => {
+			const li = Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
+				li.textContent.includes("Create Video"),
+			);
+			if (li) return li;
+			// The dropdown likely auto-closed after an apparently-silent
+			// selection — reopen it so there's something to click next tick.
+			document.querySelector('[aria-label="Select Mode"]')?.click();
+			return null;
+		},
+		isVideoModeOn,
+		20000,
+		{ label: "enableVideoMode: confirm pill" },
+	);
 	if (!enabled) {
-		qvfLog("enableVideoMode: clicked 'Create Video' but the mode pill never appeared within 20s");
+		qvfLog("enableVideoMode: clicked 'Create Video' but the mode pill never appeared within 20s (including retries)");
 		throw new Error("PAGE_NOT_READY: Selected 'Create Video' but video mode did not turn on.");
 	}
 }
@@ -285,6 +299,36 @@ function findRateLimitMessage() {
 	const text = document.body.innerText || "";
 	const match = text.match(/[^.\n]*too many requests in a short period[^.\n]*/i);
 	return match ? match[0] : "Too many requests in a short period.";
+}
+
+/**
+ * Detects a third, distinct limit message — confirmed live via a user
+ * screenshot: "Oops! There was an issue connecting to Qwen3.7-Plus. Requests
+ * rate limit exceeded, please try again later. For details, see:
+ * https://www.alibabacloud.com/help/en/model-studio/error-code#rate-limit".
+ * This is Alibaba Cloud Model Studio's own backend API rate limit — distinct
+ * wording from both findDailyLimitMessage()'s "daily usage limit" banner and
+ * findRateLimitMessage()'s "too many requests in a short period" client-side
+ * throttle. Before this existed, this message matched neither check, so
+ * waitForResult() ran blind to its full 180s timeout every time, exactly
+ * matching the reported symptom: an account hits this, the queue never
+ * detects anything happened, and it never rotates to an available next
+ * account. Matches on the doc-URL fragment as the primary anchor (very
+ * unlikely to collide with anything else on the page) with the message
+ * phrase as a fallback. Same "count of occurrences, not just presence"
+ * approach as countRateLimitOccurrences(), for the same reason: the error
+ * bubble stays in the chat transcript afterward.
+ */
+function countApiRateLimitOccurrences() {
+	const text = document.body.innerText || "";
+	const matches = text.match(/rate limit exceeded|model-studio\/error-code#rate-limit/gi);
+	return matches ? matches.length : 0;
+}
+
+function findApiRateLimitMessage() {
+	const text = document.body.innerText || "";
+	const match = text.match(/[^.\n]*rate limit exceeded[^.\n]*/i);
+	return match ? match[0] : "Requests rate limit exceeded.";
 }
 
 /**
@@ -435,6 +479,72 @@ function waitFor(check, timeoutMs, intervalMs = 300) {
 }
 
 /**
+ * Like waitFor(), but treats the initial click as unreliable rather than
+ * trusted: if checkSuccess() hasn't gone truthy after ~reclickIntervalMs and
+ * time remains in the overall timeoutMs budget, re-queries getTarget() (the
+ * DOM may have re-rendered) and clicks it again, then keeps polling — all
+ * within the SAME total timeout the caller already had, so this changes
+ * nothing about worst-case duration, only what happens with that time.
+ *
+ * Added because enableVideoMode()'s and attachReferenceImage()'s header
+ * comments already document the same recurring symptom: a click on an
+ * element that demonstrably exists can silently fail to register (menu
+ * doesn't open, or a selection doesn't confirm), previously indistinguishable
+ * from "the page is just slow" and therefore only recoverable via the full
+ * PAGE_NOT_READY -> reload-and-retry path in sidepanel.js. Nothing is ever
+ * submitted at any of these call sites, so retrying a click here is as safe
+ * as the passive wait it replaces.
+ */
+function retryClickUntil(getTarget, checkSuccess, timeoutMs, opts = {}) {
+	const { reclickIntervalMs = 3500, pollIntervalMs = 200, initialDelayMs = 0, label = "" } = opts;
+	return new Promise((resolve) => {
+		const start = Date.now();
+		let lastClickAt = Date.now(); // seed to "now", not 0 — avoids an
+		// immediate reclick-every-poll-tick spam if getTarget() is null on
+		// the very first click attempt (element not mounted yet).
+		let armed = initialDelayMs === 0;
+
+		const clickIfReady = () => {
+			const target = getTarget();
+			if (target) target.click();
+			lastClickAt = Date.now();
+		};
+
+		const poll = () => {
+			if (armed) {
+				const result = checkSuccess();
+				if (result) {
+					resolve(result);
+					return;
+				}
+			}
+			const elapsed = Date.now() - start;
+			if (elapsed > timeoutMs) {
+				resolve(null);
+				return;
+			}
+			if (armed && Date.now() - lastClickAt >= reclickIntervalMs) {
+				qvfLog(
+					`retryClickUntil${label ? " (" + label + ")" : ""}: no change after ${reclickIntervalMs}ms, re-clicking (${Math.round(elapsed / 1000)}s of ${Math.round(timeoutMs / 1000)}s budget used)`,
+				);
+				clickIfReady();
+			}
+			setTimeout(poll, pollIntervalMs);
+		};
+
+		clickIfReady(); // first click, unconditional
+		if (initialDelayMs > 0) {
+			setTimeout(() => {
+				armed = true;
+				poll();
+			}, initialDelayMs);
+		} else {
+			poll();
+		}
+	});
+}
+
+/**
  * Watch for either a finished video result or the daily-limit message,
  * whichever appears first. Confirmed live (via DOM inspection of a completed
  * generation): a finished result does NOT render as a <video> element — it's
@@ -463,6 +573,7 @@ function waitForResult(timeoutMs = 180000) {
 	// the mere presence of the phrase, is what distinguishes a fresh rate-limit
 	// hit from an old error bubble still sitting in the chat transcript.
 	const rateLimitCountAtStart = countRateLimitOccurrences();
+	const apiRateLimitCountAtStart = countApiRateLimitOccurrences();
 
 	return new Promise((resolve, reject) => {
 		const finish = (fn) => {
@@ -487,6 +598,18 @@ function waitForResult(timeoutMs = 180000) {
 				qvfLog("waitForResult: rate-limit message detected");
 				finish(() =>
 					resolve({ dailyLimitReached: false, rateLimited: true, message: findRateLimitMessage() }),
+				);
+				return;
+			}
+			if (countApiRateLimitOccurrences() > apiRateLimitCountAtStart) {
+				qvfLog("waitForResult: API rate-limit message detected");
+				finish(() =>
+					resolve({
+						dailyLimitReached: false,
+						rateLimited: false,
+						apiRateLimited: true,
+						message: findApiRateLimitMessage(),
+					}),
 				);
 				return;
 			}
@@ -597,28 +720,22 @@ async function attachReferenceImage(dataUrl, fileName, mimeType) {
 		qvfLog("attachReferenceImage: mode-select trigger not found on the page");
 		throw new Error("PAGE_NOT_READY: Could not find the mode-select trigger to open the upload menu.");
 	}
-	trigger.click();
-
-	// Small human-paced delay before picking the menu item, same rationale as
-	// enableVideoMode()'s identical pause.
-	await sleep(250 + Math.random() * 400);
-
-	// 20s, not the original 5s: confirmed live (2026-07-20, third round) that
-	// this specific item can fail to render in time even when the rest of the
-	// toolbar (composerReady+toolbarReady) already looks ready, especially
-	// right after a reload — enableVideoMode()'s equivalent wait for the
-	// "Create Video" item in this exact same dropdown already gets 20s; there
-	// was never a real reason for this item to get 4x less margin.
-	const uploadItem = await waitFor(
+	// retryClickUntil() instead of a single blind click + passive wait: same
+	// rationale as enableVideoMode()'s identical dropdown-open step (a click
+	// on an already-present element can silently fail to register right after
+	// a reload) — recovering within this 20s budget is much cheaper than
+	// failing the whole attempt and forcing a full page reload.
+	const uploadItem = await retryClickUntil(
+		() => document.querySelector('[aria-label="Select Mode"]'),
 		() =>
 			Array.from(document.querySelectorAll("li.mode-select-common-item")).find((li) =>
 				li.textContent.includes("Upload attachment"),
 			),
 		20000,
-		200,
+		{ initialDelayMs: 250 + Math.random() * 400, label: "attachReferenceImage: open menu" },
 	);
 	if (!uploadItem) {
-		qvfLog("attachReferenceImage: 'Upload attachment' option not found in the mode menu after waiting 20s");
+		qvfLog("attachReferenceImage: 'Upload attachment' option not found after retry-clicking the trigger for 20s");
 		throw new Error("PAGE_NOT_READY: Could not find the 'Upload attachment' option in the mode menu.");
 	}
 	uploadItem.click();
