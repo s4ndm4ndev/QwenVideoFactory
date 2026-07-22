@@ -95,26 +95,35 @@
     <li>Reads the state of the chat.qwen.ai composer, so it knows when a generation has finished and it's safe to submit the next prompt.</li>
     <li>Types queued prompts into the composer and submits them on your behalf.</li>
     <li>Reads generated video results so they can be downloaded, if you've enabled Auto Download.</li>
-    <li>Reads chat.qwen.ai's own on-page messaging to detect when your account's daily generation limit has been reached, so the queue can stop cleanly instead of erroring prompt-by-prompt.</li>
+    <li>Reads chat.qwen.ai's own on-page messaging to detect when your account's daily generation limit has been reached, so the queue can stop cleanly — or, if you've optionally loaded an accounts file, so it can log into the next account and keep going (see "Account rotation" below).</li>
   </ul>
-  <p>This is the only site Qwen Video Factory interacts with. It does not read, monitor, or collect data from any other tab or website you visit.</p>
+  <p>chat.qwen.ai is the only site whose content Qwen Video Factory reads or modifies, and the only destination any of your prompts, credentials, or generated results are ever sent to. Separately, the extension periodically makes network-only requests to two well-known ad-serving test URLs (<code>static.doubleclick.net</code> and <code>pagead2.googlesyndication.com</code>) purely to detect whether an ad blocker is active in your browser — no data is sent to or read from these URLs; whether the request itself succeeds or is blocked is the only signal used, and the result never leaves your device.</p>
+
+  <h2>Account rotation and credentials</h2>
+  <p>Qwen Video Factory optionally supports loading a plaintext accounts file (email/password pairs you supply) so a bulk run can keep going past a single account's daily generation limit by logging into the next account. If you use this feature:</p>
+  <ul>
+    <li>Loaded credentials are kept only in the side panel's in-memory JavaScript state — never written to <code>chrome.storage.local</code> or anywhere else on disk by this extension. Closing the side panel clears them.</li>
+    <li>Credentials are only ever typed into chat.qwen.ai's own login form, on your behalf, to log in as you. They are not transmitted to any destination other than chat.qwen.ai.</li>
+    <li>The accounts file itself, if you keep it on disk, is plaintext — this extension does not encrypt or otherwise protect it.</li>
+  </ul>
+  <p>Without an accounts file loaded, Qwen Video Factory does not create, manage, or switch between chat.qwen.ai accounts — the queue simply stops when the daily limit is reached, and waits for you to resume it once your quota resets.</p>
 
   <h2>What Qwen Video Factory does <em>not</em> do</h2>
-  <p>Qwen Video Factory does not collect, transmit, or have any means of accessing:</p>
+  <p>Qwen Video Factory does not collect or transmit, to any server or third party:</p>
   <ul>
     <li>Personally identifiable information (name, email, address, etc.)</li>
-    <li>Authentication credentials or passwords</li>
+    <li>Authentication credentials or passwords — see "Account rotation and credentials" above for the one case where credentials are handled at all, entirely locally</li>
     <li>Health, financial, or payment information</li>
     <li>Your browsing history or activity outside of the chat.qwen.ai tab</li>
     <li>Location data</li>
   </ul>
-  <p>It also does not create, manage, or switch between multiple chat.qwen.ai accounts to work around the service's daily generation limit. When that limit is reached, the queue stops and waits for you to resume it once your quota resets.</p>
 
   <h2>Where your data lives</h2>
   <p>Qwen Video Factory stores the following locally in your browser only, using Chrome's built-in storage APIs. This data never leaves your device:</p>
   <ul>
     <li>Your prompt queue and queue settings (delay range, download folder name, auto-download toggle)</li>
   </ul>
+  <p>Loaded account credentials, if you use that optional feature, live only in the side panel's in-memory state as described above — not in <code>chrome.storage.local</code>.</p>
   <p>Qwen Video Factory has no backend server. There is nowhere for this data to be sent, because no such destination exists.</p>
 
   <h2>Permissions Qwen Video Factory uses, and why</h2>

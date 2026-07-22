@@ -15,6 +15,47 @@ a change was made belongs here instead, committed like any other file.
 
 Newest first.
 
+## 2026-07-22 — Chrome Web Store publishing readiness pass
+
+- **Request**: get the extension ready to publish on the Chrome Web Store.
+- **`docs/privacy.html` was stale and inaccurate** — it explicitly claimed
+  the extension "does not create, manage, or switch between multiple
+  chat.qwen.ai accounts" and never touches "authentication credentials or
+  passwords," both written before the account-rotation feature existed (see
+  README's "Account rotation on daily-limit"). It also claimed chat.qwen.ai
+  is "the only site" the extension interacts with, which misses the
+  ad-blocker-detection requests to `static.doubleclick.net` and
+  `pagead2.googlesyndication.com` (`content-scripts/qwen.js`). Rewrote the
+  affected sections to match actual behavior: a new "Account rotation and
+  credentials" section describing in-memory-only credential handling
+  (matches the README's existing security note), and disclosure of the
+  ad-blocker probe requests (network-only, no data sent or read).
+- **Added a Privacy Policy link to the About tab** (`sidepanel/sidepanel.html`,
+  `sidepanel/sidepanel.js`), same pattern as the existing Web Site link,
+  pointing at `https://s4ndm4ndev.github.io/QwenVideoFactory/privacy.html`
+  (the `docs/` folder convention for GitHub Pages) — **GitHub Pages isn't
+  confirmed enabled on this repo yet**; verify that URL resolves before
+  actually publishing, and update `PRIVACY_POLICY_URL` if the real hosting
+  location differs.
+- **Added `scripts/package.js`**: zips exactly the runtime files Chrome needs
+  (`manifest.json`, `background.js`, `content-scripts/`, `sidepanel/`,
+  `icons/`) into `qwen-video-factory-<version>.zip` for dashboard upload —
+  excludes README/CHANGELOG/docs/scripts so the store package doesn't carry
+  repo-only files. Output stays untracked (already covered by the existing
+  `*.zip` gitignore rule). Uses `Compress-Archive` on Windows, `zip`
+  elsewhere.
+- **Added `docs/store-listing.md`**: draft copy for the Developer Dashboard's
+  Store Listing and Privacy Practices tabs (category, descriptions, single
+  purpose statement, permission justifications, data-usage disclosure
+  table) plus a checklist of what's still manual (screenshots, GitHub Pages
+  confirmation, the $5 registration fee and the submission itself — none of
+  which can be done on the user's behalf).
+- **Deliberately not changed**: the extension's name ("Qwen Video Factory")
+  still uses Alibaba's "Qwen" trademark in the title. Flagged as a possible
+  Chrome Web Store review risk (trademark-in-title policies), mitigated by
+  the existing non-affiliation disclaimer in `docs/privacy.html`'s footer —
+  left as a call for the user to make, not changed unilaterally.
+
 ## 2026-07-21 — Made mode-select clicks self-healing instead of relying on a full page reload every time one silently didn't register
 
 - **Request**: the user ran a real batch with reference images (screenshot:

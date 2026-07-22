@@ -46,11 +46,13 @@ const copyLogBtn = document.getElementById("copy-log");
 const clearLogBtn = document.getElementById("clear-log");
 const aboutVersionEl = document.getElementById("about-version");
 const aboutWebsiteLinkEl = document.getElementById("about-website-link");
+const aboutPrivacyLinkEl = document.getElementById("about-privacy-link");
 const downloadLocationNoticeEl = document.getElementById("download-location-notice");
 const dismissDownloadNoticeBtn = document.getElementById("dismiss-download-notice");
 
 const QWEN_TOOL_URL = "https://chat.qwen.ai/";
 const AUTHOR_WEBSITE_URL = "https://s4ndm4n.dev/";
+const PRIVACY_POLICY_URL = "https://s4ndm4ndev.github.io/QwenVideoFactory/privacy.html";
 
 let queue = []; // [{ text, status }]
 let currentIndex = -1;
@@ -501,6 +503,10 @@ aboutVersionEl.textContent = chrome.runtime.getManifest().version;
 
 aboutWebsiteLinkEl.addEventListener("click", () => {
 	chrome.tabs.create({ url: AUTHOR_WEBSITE_URL });
+});
+
+aboutPrivacyLinkEl.addEventListener("click", () => {
+	chrome.tabs.create({ url: PRIVACY_POLICY_URL });
 });
 
 function sleep(ms) {
